@@ -953,14 +953,27 @@ async fn run_app(
 
         terminal.draw(|frame| {
             let size = frame.area();
-            let areas = state.layout.compute(size);
+            // The BSP tree owns the main area; the one-row status bar sits at
+            // the bottom, outside the tree.
+            let main_area = Rect {
+                x: size.x,
+                y: size.y,
+                width: size.width,
+                height: size.height.saturating_sub(1),
+            };
+            let status_bar = Rect {
+                x: size.x,
+                y: size.y + main_area.height,
+                width: size.width,
+                height: size.height.saturating_sub(main_area.height),
+            };
             // Detached pop-out windows run the same render loop over a single
             // window; give it the FULL main area (the one-row status bar stays
             // at the bottom) instead of its embedded layout sub-rect.
             let single = state.tree.leaf_order().len() == 1;
 
             // Render every leaf of the BSP tree into its computed rect.
-            state.render_windows(frame, size, single);
+            state.render_windows(frame, main_area, single);
 
             // Status bar
             let conn_status = if state.connected { "connected" } else { "disconnected" };
@@ -983,7 +996,7 @@ async fn run_app(
                 ),
             ]);
             let status_para = Paragraph::new(status_line);
-            status_para.render(areas.status_bar, frame.buffer_mut());
+            status_para.render(status_bar, frame.buffer_mut());
 
             })?;
     }
@@ -1476,20 +1489,26 @@ async fn handle_input_event(
                         }
                     }
 
-                    // Start drag if near a border
-                    if let Some(edge) = state.layout.hit_test_border(full_area, mouse.column, mouse.row) {
-                        state.layout.dragging = Some(edge);
-                        state.layout.drag_start = Some((mouse.column, mouse.row));
+                    // Start drag if the click is on the focused leaf's parent split edge.
+                    // A pane's borders are its computed rect edges; dragging
+                    // from within the leaf near its left/top edge resizes the
+                    // shared split. (Simplest robust rule: drag from the
+                    // focused leaf's own edge region.)
+                    if let Some(edge) = state.tree.focused_drag_edge(mouse.column, mouse.row) {
+                        state.tree.dragging = Some(edge);
+                        state.tree.drag_start = Some((mouse.column, mouse.row));
                     }
                 }
                 crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                    if let Some(edge) = state.layout.dragging {
-                        state.layout.update_from_drag(full_area, edge, mouse.column, mouse.row);
+                    if let Some(edge) = state.tree.dragging {
+                        state.tree.update_from_drag(edge, mouse.column, mouse.row);
+                        state.force_full_redraw = true;
                     }
                 }
                 crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                    state.layout.dragging = None;
-                    state.layout.drag_start = None;
+                    state.tree.dragging = None;
+                    state.tree.drag_start = None;
+                    persist_layout(state);
                 }
                 _ => {}
             }

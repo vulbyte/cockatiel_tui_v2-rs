@@ -152,6 +152,18 @@ pub struct LayoutTree {
     /// Path from the root to the focused leaf (index of child_a/child_b at
     /// each level). Empty when the root itself is a leaf.
     pub focus: Vec<usize>,
+    /// Border-drag state for resizing the focused pane's parent split.
+    pub dragging: Option<DragDir>,
+    pub drag_start: Option<(u16, u16)>,
+}
+
+/// Which edge of the focused pane is being dragged to resize the shared split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragDir {
+    /// Dragging the pane's top edge (resize the parent vertical split).
+    Top,
+    /// Dragging the pane's left edge (resize the parent horizontal split).
+    Left,
 }
 
 /// Default 5-pane arrangement, mirroring the current fixed grid so the new
@@ -180,6 +192,8 @@ pub fn default_tree() -> LayoutTree {
     LayoutTree {
         root: split(Axis::Horizontal, 0.30, left_col, right_col),
         focus: vec![0, 0],
+        dragging: None,
+        drag_start: None,
     }
 }
 
@@ -201,7 +215,7 @@ impl LayoutTree {
     pub fn from_snapshot(snap: LayoutSnapshot) -> LayoutTree {
         let root = from_snapshot_node(snap);
         // Focus the first leaf (depth-first order) after rebuild.
-        let mut tree = LayoutTree { root, focus: Vec::new() };
+        let mut tree = LayoutTree { root, focus: Vec::new(), dragging: None, drag_start: None };
         let first = tree.leaf_order().first().cloned().map(|(id, _)| id).unwrap_or_else(|| "pane".to_string());
         tree.focus = tree.path_to_id(&first);
         tree
@@ -254,6 +268,8 @@ pub fn single_tree(view: ViewType) -> LayoutTree {
     LayoutTree {
         root: leaf("pane", view),
         focus: vec![],
+        dragging: None,
+        drag_start: None,
     }
 }
 
@@ -266,6 +282,8 @@ pub fn tree_with_window(view: ViewType, window: Box<dyn Window>) -> LayoutTree {
             rect: Rect::default(),
         })),
         focus: vec![],
+        dragging: None,
+        drag_start: None,
     }
 }
 
@@ -587,6 +605,48 @@ impl LayoutTree {
         self.focus = self.path_to_id(id);
     }
 
+    /// Whether a click at `(x, y)` is on the focused leaf's draggable edge
+    /// (its top or left border), and it has a parent split to resize.
+    pub fn focused_drag_edge(&self, x: u16, y: u16) -> Option<DragDir> {
+        if self.focus.len() < 2 {
+            return None; // no parent split to resize
+        }
+        let rect = self.focused_rect()?;
+        let threshold = 1;
+        // Top edge: y within 1 of rect.y, x within the leaf's horizontal span.
+        if y >= rect.y.saturating_sub(threshold) && y <= rect.y + threshold
+            && x >= rect.x && x <= rect.x + rect.width
+        {
+            return Some(DragDir::Top);
+        }
+        // Left edge: x within 1 of rect.x, y within the leaf's vertical span.
+        if x >= rect.x.saturating_sub(threshold) && x <= rect.x + threshold
+            && y >= rect.y && y <= rect.y + rect.height
+        {
+            return Some(DragDir::Left);
+        }
+        None
+    }
+
+    /// Update the focused pane's parent split ratio from a mouse drag, using
+    /// the drag-start point to derive the direction/magnitude.
+    pub fn update_from_drag(&mut self, dir: DragDir, x: u16, y: u16) {
+        let (start_x, start_y) = self.drag_start.unwrap_or((x, y));
+        let delta = match dir {
+            DragDir::Top => {
+                // Positive when dragging down (grows the top child).
+                let dy = i32::from(y) - i32::from(start_y);
+                dy as f32 / 200.0
+            }
+            DragDir::Left => {
+                let dx = i32::from(x) - i32::from(start_x);
+                dx as f32 / 200.0
+            }
+        };
+        let _ = self.resize_focused(delta);
+        self.drag_start = Some((x, y));
+    }
+
     /// Move focus to the next leaf in tree order (used by Tab / FocusNext).
     pub fn focus_next(&mut self) {
         let order = self.leaf_order();
@@ -871,6 +931,8 @@ mod tests {
         let mut t = LayoutTree {
             root: split(Axis::Horizontal, 0.5, leaf("a", ViewType::Logs), leaf("b", ViewType::Logs)),
             focus: vec![0],
+            dragging: None,
+            drag_start: None,
         };
         t.compute(Rect { x: 0, y: 0, width: 20, height: 6 });
         // Splitting the 20x6 left pane horizontally -> 10 wide each, < MIN_WIDTH.
@@ -928,6 +990,8 @@ mod tests {
         let mut t = LayoutTree {
             root: leaf("only", ViewType::Logs),
             focus: vec![],
+            dragging: None,
+            drag_start: None,
         };
         assert!(!t.join_focused(), "a single-pane root has nothing to join");
     }
