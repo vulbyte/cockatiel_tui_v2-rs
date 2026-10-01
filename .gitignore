@@ -4,3 +4,4 @@ hotkey_config.json
 color_config.json
 *.db
 .env
+layout.json
