@@ -1,0 +1,21 @@
+[package]
+name = "cockatiel-tui-v2"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+cockatiel-client = { git = "https://github.com/vulbyte/cockatiel_client-rs", rev = "0b9a7285d9445f893a03edbf0e174aa374ec05bd" }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7"] }
+tokio = { version = "1", features = ["full"] }
+open = "5"
+rustls = "0.23"
+rustls-pemfile = "2"

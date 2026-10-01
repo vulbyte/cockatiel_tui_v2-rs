@@ -1,0 +1,6 @@
+/target
+config.json
+hotkey_config.json
+color_config.json
+*.db
+.env

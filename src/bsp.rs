@@ -1,0 +1,691 @@
+//! Blender-inspired Binary Space Partitioning (BSP) layout engine.
+//!
+//! The terminal is a single root rectangle recursively divided into subregions
+//! by a binary tree:
+//!
+//! ```text
+//!         [ Split Node ] (Axis: Vertical, Ratio: 0.40)
+//!          /          \
+//!  [ Leaf ]        [ Split Node ] (Axis: Horizontal, Ratio: 0.60)
+//!  view: A             /          \
+//!              [ Leaf ]          [ Leaf ]
+//!              view: B           view: C
+//! ```
+//!
+//! * `SplitNode` divides its rectangle by `ratio` along `axis` into two child
+//!   subtrees (left/top and right/bottom).
+//! * `LeafNode` is a pane hosting a single `ViewType` (one of the mounted
+//!   windows), with its own `calculated_rect`.
+//!
+//! Focus is a *path* from the root to the focused leaf (e.g. `[0, 1]` — the
+//! right child of the root), which lets a leaf host any view and lets
+//! navigation walk the tree spatially instead of a fixed rotation.
+//!
+//! Some tree mutations are implemented and tested here but not yet bound to a
+//! key (split/join come in the next phase); they are kept ready rather than
+//! deleted.
+
+#![allow(dead_code)]
+
+use ratatui::layout::Rect;
+
+use crate::app::{Window, WindowId};
+
+/// Minimum pane size, below which a split or resize is rejected.
+pub const MIN_WIDTH: u16 = 12;
+/// Minimum pane height, below which a split or resize is rejected.
+pub const MIN_HEIGHT: u16 = 5;
+
+/// A view type that a leaf pane can host. These wrap the existing six window
+/// implementations; a leaf's view can be swapped at runtime (the dropdown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewType {
+    CockatielInfo,
+    Logs,
+    ModuleManager,
+    EngineGraph,
+    Prompts,
+    TopUsers,
+}
+
+impl ViewType {
+    pub fn all() -> &'static [ViewType] {
+        &[
+            ViewType::CockatielInfo,
+            ViewType::Logs,
+            ViewType::ModuleManager,
+            ViewType::EngineGraph,
+            ViewType::Prompts,
+            ViewType::TopUsers,
+        ]
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewType::CockatielInfo => "cockatiel_info",
+            ViewType::Logs => "logs",
+            ViewType::ModuleManager => "module_manager",
+            ViewType::EngineGraph => "engine_graph",
+            ViewType::Prompts => "prompts",
+            ViewType::TopUsers => "top_users",
+        }
+    }
+
+    pub fn window_id(self) -> WindowId {
+        match self {
+            ViewType::CockatielInfo => WindowId::Logo,
+            ViewType::Logs => WindowId::Log,
+            ViewType::ModuleManager => WindowId::Modules,
+            ViewType::EngineGraph => WindowId::Chart,
+            ViewType::Prompts => WindowId::Prompts,
+            ViewType::TopUsers => WindowId::Users,
+        }
+    }
+}
+
+/// The current tool mounted in a leaf. The window state lives here so a swap
+/// can drop it (fresh view) or keep it, per view type.
+pub struct LeafContent {
+    pub view: ViewType,
+    pub window: Box<dyn Window>,
+}
+
+impl std::fmt::Debug for LeafContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafContent").field("view", &self.view).finish()
+    }
+}
+
+/// A node in the layout tree.
+#[derive(Debug)]
+pub enum Node {
+    Split(SplitNode),
+    Leaf(LeafNode),
+}
+
+/// An internal divider: splits its rectangle into two child subtrees.
+#[derive(Debug)]
+pub struct SplitNode {
+    /// HORIZONTAL = left/right split; VERTICAL = top/bottom split.
+    pub axis: Axis,
+    /// Fraction of the rectangle allocated to the left/top child (0.05..0.95).
+    pub ratio: f32,
+    pub child_a: Box<Node>,
+    pub child_b: Box<Node>,
+}
+
+/// A leaf: one mounted view, holding its own window + calculated rect.
+#[derive(Debug)]
+pub struct LeafNode {
+    pub id: String,
+    pub content: LeafContent,
+    pub rect: Rect,
+}
+
+/// Split axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    /// Left/right split.
+    Horizontal,
+    /// Top/bottom split.
+    Vertical,
+}
+
+impl Axis {
+    pub fn name(self) -> &'static str {
+        match self {
+            Axis::Horizontal => "h",
+            Axis::Vertical => "v",
+        }
+    }
+}
+
+/// The layout tree + focus path.
+#[derive(Debug)]
+pub struct LayoutTree {
+    pub root: Box<Node>,
+    /// Path from the root to the focused leaf (index of child_a/child_b at
+    /// each level). Empty when the root itself is a leaf.
+    pub focus: Vec<usize>,
+}
+
+/// Default 5-pane arrangement, mirroring the current fixed grid so the new
+/// engine has no visual regression on first launch:
+///
+/// ```text
+/// ┌──────────────┬───────────────────────┐
+/// │ info         │ module_manager        │
+/// ├──────────────┤                       │
+/// │ logs         │                       │
+/// ├──────────────┼──────────┬────────────┤
+/// │ engine_graph │          │ prompts    │
+/// └──────────────┴──────────┴────────────┘
+/// ```
+pub fn default_tree() -> LayoutTree {
+    let info = leaf("info", ViewType::CockatielInfo);
+    let logs = leaf("logs", ViewType::Logs);
+    let left_col = split(Axis::Vertical, 0.50, info, logs);
+
+    let module_manager = leaf("modules", ViewType::ModuleManager);
+    let graph = leaf("graph", ViewType::EngineGraph);
+    let prompts = leaf("prompts", ViewType::Prompts);
+    let bottom = split(Axis::Horizontal, 0.60, graph, prompts);
+    let right_col = split(Axis::Vertical, 0.60, module_manager, bottom);
+
+    LayoutTree {
+        root: split(Axis::Horizontal, 0.30, left_col, right_col),
+        focus: vec![0, 0],
+    }
+}
+
+/// Build a tree with a single leaf (detached pop-out mode).
+pub fn single_tree(view: ViewType) -> LayoutTree {
+    LayoutTree {
+        root: leaf("pane", view),
+        focus: vec![],
+    }
+}
+
+/// Build a tree with a single leaf hosting an already-constructed window.
+pub fn tree_with_window(view: ViewType, window: Box<dyn Window>) -> LayoutTree {
+    LayoutTree {
+        root: Box::new(Node::Leaf(LeafNode {
+            id: "pane".to_string(),
+            content: LeafContent { view, window },
+            rect: Rect::default(),
+        })),
+        focus: vec![],
+    }
+}
+
+fn leaf(id: &str, view: ViewType) -> Box<Node> {
+    Box::new(Node::Leaf(LeafNode {
+        id: id.to_string(),
+        content: LeafContent {
+            view,
+            window: make_window(view),
+        },
+        rect: Rect::default(),
+    }))
+}
+
+fn split(axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node>) -> Box<Node> {
+    Box::new(Node::Split(SplitNode {
+        axis,
+        ratio,
+        child_a: a,
+        child_b: b,
+    }))
+}
+
+/// Build a window for a view type. The existing six window impls are reused.
+pub fn make_window(view: ViewType) -> Box<dyn Window> {
+    use crate::windows::{ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, UsersWindow};
+    match view {
+        ViewType::CockatielInfo => Box::new(LogoWindow),
+        ViewType::Logs => Box::new(LogWindow::new()),
+        ViewType::ModuleManager => Box::new(ModulesWindow::new()),
+        ViewType::EngineGraph => Box::new(ChartWindow::new()),
+        ViewType::Prompts => Box::new(PromptsWindow::new()),
+        ViewType::TopUsers => Box::new(UsersWindow::new()),
+    }
+}
+
+impl LayoutTree {
+    /// Recursively compute every leaf's rectangle from `root_rect`, honoring
+    /// `ratio` at each split and clamping to the minimum pane size.
+    pub fn compute(&mut self, root_rect: Rect) {
+        compute_node(&mut self.root, root_rect);
+    }
+
+    /// The id of the focused leaf.
+    pub fn focused_id(&self) -> String {
+        match leaf_at(&self.root, &self.focus) {
+            Node::Leaf(l) => l.id.clone(),
+            Node::Split(_) => String::from("root"),
+        }
+    }
+
+    /// The focused leaf's view type.
+    pub fn focused_view(&self) -> ViewType {
+        match leaf_at(&self.root, &self.focus) {
+            Node::Leaf(l) => l.content.view,
+            Node::Split(_) => ViewType::CockatielInfo,
+        }
+    }
+
+    /// The focused leaf's window (mutable).
+    pub fn focused_window(&mut self) -> Option<&mut Box<dyn Window>> {
+        match leaf_at_mut(&mut self.root, &self.focus) {
+            Node::Leaf(l) => Some(&mut l.content.window),
+            Node::Split(_) => None,
+        }
+    }
+
+    /// The focused leaf's calculated rectangle (for rendering the active border).
+    pub fn focused_rect(&self) -> Option<Rect> {
+        match leaf_at(&self.root, &self.focus) {
+            Node::Leaf(l) => Some(l.rect),
+            Node::Split(_) => None,
+        }
+    }
+
+    /// Iterate every leaf with its id, view, rect, and whether it is focused.
+    pub fn leaves(&self) -> Vec<(String, ViewType, Rect, bool)> {
+        let mut out = Vec::new();
+        collect_leaves(&self.root, &self.focus, &mut out);
+        out
+    }
+
+    /// Find the first leaf whose view maps to `id`, returning its window.
+    pub fn window_mut_by_id(&mut self, id: WindowId) -> Option<&mut Box<dyn Window>> {
+        let mut stack: Vec<&mut Node> = vec![&mut self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&mut s.child_b);
+                    stack.push(&mut s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if l.content.view.window_id() == id {
+                        return Some(&mut l.content.window);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The window at a given path from the root (mutable).
+    pub fn window_mut_by_path(&mut self, path: &[usize]) -> Option<&mut Box<dyn Window>> {
+        match leaf_at_mut(&mut self.root, path) {
+            Node::Leaf(l) => Some(&mut l.content.window),
+            Node::Split(_) => None,
+        }
+    }
+
+    /// Find the first leaf whose view maps to `id`, returning an immutable
+    /// window reference.
+    pub fn window_by_id(&self, id: WindowId) -> Option<&Box<dyn Window>> {
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&s.child_b);
+                    stack.push(&s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if l.content.view.window_id() == id {
+                        return Some(&l.content.window);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// True if any leaf's window satisfies `f`.
+    pub fn any_window(&self, f: impl Fn(&dyn Window) -> bool) -> bool {
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&s.child_b);
+                    stack.push(&s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if f(l.content.window.as_ref()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The first clickable link any leaf's window exposes.
+    pub fn any_window_link(&self) -> Option<(Rect, String)> {
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&s.child_b);
+                    stack.push(&s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if let Some(link) = l.content.window.pending_link() {
+                        return Some(link);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether any leaf hosts the given view (by its WindowId).
+    pub fn has_view(&self, id: WindowId) -> bool {
+        self.leaves().iter().any(|(_, v, _, _)| v.window_id() == id)
+    }
+
+    /// Split the focused leaf along `axis`. Returns false (and changes nothing)
+    /// if the resulting panes would fall below the minimum size.
+    pub fn split_focused(&mut self, axis: Axis) -> bool {
+        let target = self.focused_rect().unwrap_or_default();
+        let (a_ok, b_ok) = match axis {
+            Axis::Horizontal => {
+                let left = (target.width as f32 * 0.5) as u16;
+                let right = target.width.saturating_sub(left);
+                (left >= MIN_WIDTH, right >= MIN_WIDTH)
+            }
+            Axis::Vertical => {
+                let top = (target.height as f32 * 0.5) as u16;
+                let bottom = target.height.saturating_sub(top);
+                (top >= MIN_HEIGHT, bottom >= MIN_HEIGHT)
+            }
+        };
+        if !a_ok || !b_ok {
+            return false;
+        }
+
+        // Capture the focused leaf's view (the left child keeps it).
+        let focused_view = self.focused_view();
+        let path = self.focus.clone();
+        let a_id = format!("{}-a", uuid_fragment());
+        let b_id = format!("{}-b", uuid_fragment());
+
+        let old_root = std::mem::replace(&mut self.root, Box::new(Node::Leaf(LeafNode {
+            id: "swap".to_string(),
+            content: LeafContent { view: ViewType::Logs, window: make_window(ViewType::Logs) },
+            rect: Rect::default(),
+        })));
+        self.root = replace_leaf(old_root, &path, |_old| {
+            Node::Split(SplitNode {
+                axis,
+                ratio: 0.5,
+                child_a: Box::new(Node::Leaf(LeafNode {
+                    id: a_id,
+                    content: LeafContent { view: focused_view, window: make_window(focused_view) },
+                    rect: Rect::default(),
+                })),
+                child_b: Box::new(Node::Leaf(LeafNode {
+                    id: b_id,
+                    content: LeafContent { view: ViewType::Logs, window: make_window(ViewType::Logs) },
+                    rect: Rect::default(),
+                })),
+            })
+        });
+        self.focus.push(0);
+        true
+    }
+
+    /// Swap the focused leaf's view (the dropdown action). Returns the previous
+    /// view. The old window state is dropped (a fresh window mounts) — per-view
+    /// state preservation is a later refinement.
+    pub fn swap_focused_view(&mut self, new_view: ViewType) -> Option<ViewType> {
+        let path = self.focus.clone();
+        let old = match leaf_at_mut(&mut self.root, &path) {
+            Node::Leaf(l) => {
+                let old = l.content.view;
+                l.content.view = new_view;
+                l.content.window = make_window(new_view);
+                Some(old)
+            }
+            Node::Split(_) => None,
+        };
+        old
+    }
+
+    /// Move focus to the next leaf in tree order (used by Tab / FocusNext).
+    pub fn focus_next(&mut self) {
+        let order = self.leaf_order();
+        let idx = order.iter().position(|(id, _)| *id == self.focused_id()).unwrap_or(0);
+        let next = (idx + 1) % order.len();
+        let target_id = order[next].0.clone();
+        self.focus = self.path_to_id(&target_id);
+    }
+
+    /// Move focus to the previous leaf in tree order (FocusPrev / Shift+Tab).
+    pub fn focus_prev(&mut self) {
+        let order = self.leaf_order();
+        let idx = order.iter().position(|(id, _)| *id == self.focused_id()).unwrap_or(0);
+        let prev = if idx == 0 { order.len() - 1 } else { idx - 1 };
+        let target_id = order[prev].0.clone();
+        self.focus = self.path_to_id(&target_id);
+    }
+
+    /// All leaf ids in tree (depth-first) order.
+    pub fn leaf_order(&self) -> Vec<(String, ViewType)> {
+        let mut out = Vec::new();
+        collect_order(&self.root, &mut out);
+        out
+    }
+
+    fn path_to_id(&self, id: &str) -> Vec<usize> {
+        let mut path = Vec::new();
+        if find_path(&self.root, id, &mut path) {
+            path
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn uuid_fragment() -> String {
+    // Cheap unique suffix (no uuid dep needed for layout ids).
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    format!("{:08x}", nanos)
+}
+
+fn compute_node(node: &mut Node, rect: Rect) {
+    match node {
+        Node::Split(s) => {
+            let (a, b) = split_rects(s.axis, s.ratio, rect);
+            compute_node(&mut s.child_a, a);
+            compute_node(&mut s.child_b, b);
+        }
+        Node::Leaf(l) => {
+            l.rect = rect;
+        }
+    }
+}
+
+pub(crate) fn leaf_at<'a>(node: &'a Node, path: &[usize]) -> &'a Node {
+    let mut cur = node;
+    for &i in path {
+        if let Node::Split(s) = cur {
+            cur = if i == 0 { &s.child_a } else { &s.child_b };
+        } else {
+            return cur;
+        }
+    }
+    cur
+}
+
+/// Split `rect` along `axis` by `ratio`, returning the two child rects
+/// (left/top first).
+pub fn split_rects(axis: Axis, ratio: f32, rect: Rect) -> (Rect, Rect) {
+    match axis {
+        Axis::Horizontal => {
+            let left = (rect.width as f32 * ratio) as u16;
+            let right = rect.width.saturating_sub(left);
+            (
+                Rect { x: rect.x, y: rect.y, width: left, height: rect.height },
+                Rect { x: rect.x + left, y: rect.y, width: right, height: rect.height },
+            )
+        }
+        Axis::Vertical => {
+            let top = (rect.height as f32 * ratio) as u16;
+            let bottom = rect.height.saturating_sub(top);
+            (
+                Rect { x: rect.x, y: rect.y, width: rect.width, height: top },
+                Rect { x: rect.x, y: rect.y + top, width: rect.width, height: bottom },
+            )
+        }
+    }
+}
+
+fn leaf_at_mut<'a>(node: &'a mut Node, path: &[usize]) -> &'a mut Node {
+    let mut cur = node;
+    for &i in path {
+        if let Node::Split(s) = cur {
+            cur = if i == 0 { &mut s.child_a } else { &mut s.child_b };
+        } else {
+            return cur;
+        }
+    }
+    cur
+}
+
+fn replace_leaf<F>(mut node: Box<Node>, path: &[usize], f: F) -> Box<Node>
+where
+    F: FnOnce(&LeafNode) -> Node,
+{
+    let mut cur = &mut *node;
+    for &i in path {
+        if let Node::Split(s) = cur {
+            cur = if i == 0 { &mut s.child_a } else { &mut s.child_b };
+        } else {
+            break;
+        }
+    }
+    if let Node::Leaf(l) = cur {
+        *cur = f(l);
+    }
+    node
+}
+
+fn collect_leaves(node: &Node, focus: &[usize], out: &mut Vec<(String, ViewType, Rect, bool)>) {
+    let mut path = Vec::new();
+    collect_leaves_path(node, focus, &mut path, out);
+}
+
+fn collect_leaves_path(
+    node: &Node,
+    focus: &[usize],
+    path: &mut Vec<usize>,
+    out: &mut Vec<(String, ViewType, Rect, bool)>,
+) {
+    match node {
+        Node::Split(s) => {
+            path.push(0);
+            collect_leaves_path(&s.child_a, focus, path, out);
+            path.pop();
+            path.push(1);
+            collect_leaves_path(&s.child_b, focus, path, out);
+            path.pop();
+        }
+        Node::Leaf(l) => {
+            let is_focus = path.as_slice() == focus;
+            out.push((l.id.clone(), l.content.view, l.rect, is_focus));
+        }
+    }
+}
+
+fn collect_order(node: &Node, out: &mut Vec<(String, ViewType)>) {
+    match node {
+        Node::Split(s) => {
+            collect_order(&s.child_a, out);
+            collect_order(&s.child_b, out);
+        }
+        Node::Leaf(l) => out.push((l.id.clone(), l.content.view)),
+    }
+}
+
+fn find_path(node: &Node, id: &str, path: &mut Vec<usize>) -> bool {
+    match node {
+        Node::Leaf(l) => l.id == id,
+        Node::Split(s) => {
+            path.push(0);
+            if find_path(&s.child_a, id, path) {
+                return true;
+            }
+            path.pop();
+            path.push(1);
+            if find_path(&s.child_b, id, path) {
+                return true;
+            }
+            path.pop();
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree_3() -> LayoutTree {
+        default_tree()
+    }
+
+    #[test]
+    fn default_tree_has_five_leaves() {
+        let t = tree_3();
+        let leaves = t.leaf_order();
+        assert_eq!(leaves.len(), 5);
+        let names: Vec<&str> = leaves.iter().map(|(_, v)| v.name()).collect();
+        assert_eq!(names, vec!["cockatiel_info", "logs", "module_manager", "engine_graph", "prompts"]);
+    }
+
+    #[test]
+    fn compute_assigns_rects_that_sum_to_the_root() {
+        let mut t = tree_3();
+        let root = Rect { x: 0, y: 0, width: 120, height: 40 };
+        t.compute(root);
+        // Every leaf got a nonzero rect inside the root.
+        for (_, _, rect, _) in t.leaves() {
+            assert!(rect.width > 0 && rect.height > 0);
+            assert!(rect.x + rect.width <= root.width);
+            assert!(rect.y + rect.height <= root.height);
+        }
+        // The focused leaf is the first one by default (info).
+        assert_eq!(t.focused_id(), "info");
+    }
+
+    #[test]
+    fn split_focused_rejects_when_too_small() {
+        let mut t = LayoutTree {
+            root: split(Axis::Horizontal, 0.5, leaf("a", ViewType::Logs), leaf("b", ViewType::Logs)),
+            focus: vec![0],
+        };
+        t.compute(Rect { x: 0, y: 0, width: 20, height: 6 });
+        // Splitting the 20x6 left pane horizontally -> 10 wide each, < MIN_WIDTH.
+        assert!(!t.split_focused(Axis::Horizontal));
+        // Vertical split of 20x6 -> 3 tall each, < MIN_HEIGHT.
+        assert!(!t.split_focused(Axis::Vertical));
+    }
+
+    #[test]
+    fn split_focused_splits_and_focuses_the_left_child() {
+        let mut t = tree_3();
+        t.compute(Rect { x: 0, y: 0, width: 120, height: 40 });
+        t.focus = t.path_to_id("modules");
+        assert!(t.split_focused(Axis::Horizontal));
+        let leaves = t.leaf_order();
+        assert_eq!(leaves.len(), 6);
+        // Focus is on the left child of the new split (same view as before).
+        assert_eq!(t.focused_view(), ViewType::ModuleManager);
+    }
+
+    #[test]
+    fn swap_focused_view_changes_the_view() {
+        let mut t = tree_3();
+        t.focus = t.path_to_id("logs");
+        let old = t.swap_focused_view(ViewType::TopUsers);
+        assert_eq!(old, Some(ViewType::Logs));
+        assert_eq!(t.focused_view(), ViewType::TopUsers);
+    }
+
+    #[test]
+    fn focus_next_walks_all_leaves_in_order() {
+        let mut t = tree_3();
+        let order = t.leaf_order();
+        let first = t.focused_id();
+        assert_eq!(first, order[0].0);
+        t.focus_next();
+        assert_eq!(t.focused_id(), order[1].0);
+        t.focus_prev();
+        assert_eq!(t.focused_id(), order[0].0);
+    }
+}
