@@ -5,3 +5,4 @@ color_config.json
 *.db
 .env
 layout.json
+{}
