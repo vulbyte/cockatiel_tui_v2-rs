@@ -670,6 +670,7 @@ pub fn launch_engine() -> Result<Child, String> {
         .env("USER_DB_PORT", USER_DB_DEFAULT_PORT.to_string())
         .env("USER_DB_TOKEN", user_db_token())
         .env("USER_DB_BACKUP_PATH", user_db_backup_path().to_string_lossy().to_string())
+        .env("COCKATIEL_RANK_CHART", rank_chart_path().to_string_lossy().to_string())
         .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log_file));
     // Own process group (PGID = child PID) so a group TERM/KILL later reaches
@@ -688,6 +689,14 @@ pub fn user_db_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("cockatiel_user_database-rs")
+}
+
+/// The shared rank chart at the repo root. Injected as `COCKATIEL_RANK_CHART`
+/// into engine + module processes so every consumer reads the same tier names.
+pub fn rank_chart_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("rank_chart.json")
 }
 
 pub const USER_DB_DEFAULT_PORT: u16 = 9736;
@@ -1478,6 +1487,7 @@ pub fn spawn_from_parts(p: &Plugin, cmd: &str, args: &[String]) -> Result<Child,
     if let Some(cert) = engine_tls_cert_path() {
         command.env("COCKATIEL_TLS_CERT", cert);
     }
+    command.env("COCKATIEL_RANK_CHART", rank_chart_path().to_string_lossy().to_string());
     // Own process group (PGID = child PID) so a group TERM/KILL later reaches
     // the module AND anything it spawns — no orphaned grandchildren.
     #[cfg(unix)]

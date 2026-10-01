@@ -2,6 +2,7 @@ mod app;
 mod bsp;
 mod colors;
 mod db;
+mod rank_chart;
 mod event;
 mod hotkeys;
 mod layout;

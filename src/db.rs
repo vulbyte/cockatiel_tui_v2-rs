@@ -57,31 +57,15 @@ pub struct UserSummary {
     pub total_score: i64,
     /// Chat messages this user has sent.
     pub messages_sent: i64,
-    /// The user's current numeric rank (computed server-side by the user db).
-    pub rank: i64,
+    /// The user's numeric rank on the 0-1 scale (computed server-side by the
+    /// user db). Numbers are for logic; tier NAMES come from the root
+    /// `rank_chart.json`.
+    pub rank: f32,
 }
 
 impl UserSummary {
-    pub fn rank_tier(&self) -> &'static str {
-        rank_tier(self.score)
-    }
-}
-
-/// Rank tier derived from score: opal>=50, gold>=20, silver>=5, coal<=-5,
-/// trash<=-20. Order matters (trash is checked before coal since -20<=-5).
-pub fn rank_tier(score: i64) -> &'static str {
-    if score >= 50 {
-        "opal"
-    } else if score >= 20 {
-        "gold"
-    } else if score >= 5 {
-        "silver"
-    } else if score <= -20 {
-        "trash"
-    } else if score <= -5 {
-        "coal"
-    } else {
-        "neutral"
+    pub fn rank_tier(&self) -> String {
+        crate::rank_chart::tier_name(self.rank)
     }
 }
 
@@ -540,7 +524,7 @@ fn parse_user(v: &serde_json::Value) -> Option<UserSummary> {
         flags: v.get("flags").and_then(|x| x.as_str()).unwrap_or("{}").to_string(),
         total_score: v.get("total_score").and_then(|x| x.as_i64()).unwrap_or(0),
         messages_sent: v.get("messages_sent").and_then(|x| x.as_i64()).unwrap_or(0),
-        rank: v.get("rank").and_then(|x| x.as_i64()).unwrap_or(0),
+        rank: v.get("rank").and_then(|x| x.as_f64()).map(|f| f as f32).unwrap_or(0.0),
     })
 }
 
@@ -577,13 +561,13 @@ mod tests {
                     "is_sponsor": true, "is_moderator": false, "is_admin": true, "is_owner": false,
                     "score": 60, "commendations": 10, "reprimands": 2,
                     "channels": [{"platform": "twitch", "channel_id": "c1", "handle": "alice"}],
-                    "flags": "{}", "created_at": 1, "updated_at": 2,
+                    "flags": "{}", "created_at": 1, "updated_at": 2, "rank": 0.93,
                 },
                 {
                     "uuid7": "u2", "username": "bob",
                     "is_sponsor": false, "is_moderator": false, "is_admin": false, "is_owner": false,
                     "score": -20, "commendations": 0, "reprimands": 5,
-                    "channels": [], "flags": "{}", "created_at": 1, "updated_at": 2,
+                    "channels": [], "flags": "{}", "created_at": 1, "updated_at": 2, "rank": 0.02,
                 }
             ]
         });
@@ -596,7 +580,7 @@ mod tests {
         assert!(stats.users[0].is_sponsor);
         assert_eq!(stats.users[0].channels.len(), 1);
         assert_eq!(stats.users[0].rank_tier(), "opal");
-        assert_eq!(stats.users[1].rank_tier(), "trash");
+        assert_eq!(stats.users[1].rank_tier(), "coal");
         assert!(stats.user_last_error.is_none());
     }
 

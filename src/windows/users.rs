@@ -122,11 +122,21 @@ impl UsersWindow {
 
     fn rank_color(&self, tier: &str) -> Color {
         match tier {
-            "opal" => Color::LightCyan,
-            "gold" => Color::Yellow,
-            "silver" => Color::Gray,
             "coal" => Color::DarkGray,
-            "trash" => Color::Red,
+            "copper" => Color::Rgb(184, 115, 51),
+            "bronze" => Color::Rgb(205, 127, 50),
+            "silver" => Color::Gray,
+            "gold" => Color::Yellow,
+            "sapphire" => Color::Blue,
+            "emerald" => Color::Green,
+            "ruby" => Color::Red,
+            "diamond" => Color::LightCyan,
+            "opal" => Color::Cyan,
+            // Roles + any custom streamer tier name.
+            "owner" => Color::LightRed,
+            "admin" => Color::Magenta,
+            "mod" => Color::LightGreen,
+            "sponsor" => Color::LightYellow,
             _ => Color::White,
         }
     }
@@ -392,7 +402,7 @@ impl UsersWindow {
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {:<20}", truncate(&user.username, 20)),
-                    row_style.fg(if is_selected { Color::Black } else { self.rank_color(tier) }),
+                    row_style.fg(if is_selected { Color::Black } else { self.rank_color(&tier) }),
                 ),
                 Span::styled(
                     format!("{:>4}", user.score),
@@ -428,7 +438,7 @@ impl UsersWindow {
             Span::styled(
                 format!(" {}", selected.username),
                 Style::default()
-                    .fg(self.rank_color(tier))
+.fg(self.rank_color(&tier))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -468,7 +478,7 @@ impl UsersWindow {
         let score_line = Line::from(vec![
             Span::styled(
                 format!("  score {}", selected.score),
-                Style::default().fg(self.rank_color(tier)).add_modifier(Modifier::BOLD),
+                Style::default().fg(self.rank_color(&tier)).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(
@@ -987,14 +997,13 @@ mod tests {
     use super::*;
     use crate::app::Window;
     use crate::colors::default_colors;
-    use crate::db::rank_tier;
     use crate::hotkeys::default_hotkeys;
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
     }
 
-    fn user(uuid: &str, name: &str, score: i64) -> UserSummary {
+    fn user(uuid: &str, name: &str, score: i64, rank: f32) -> UserSummary {
         UserSummary {
             uuid7: uuid.to_string(),
             username: name.to_string(),
@@ -1009,35 +1018,38 @@ mod tests {
             flags: "{}".to_string(),
             total_score: score,
             messages_sent: 0,
-            rank: 0,
+            rank,
         }
     }
 
     fn stats_with_users() -> GlobalStats {
         let mut s = GlobalStats::default();
         s.users = vec![
-            user("00000000-0000-7000-0000-000000000001", "alice", 60),
-            user("00000000-0000-7000-0000-000000000002", "bob", 25),
-            user("00000000-0000-7000-0000-000000000003", "carol", -8),
-            user("00000000-0000-7000-0000-000000000004", "dave", 3),
+            user("00000000-0000-7000-0000-000000000001", "alice", 60, 0.93),
+            user("00000000-0000-7000-0000-000000000002", "bob", 25, 0.45),
+            user("00000000-0000-7000-0000-000000000003", "carol", -8, 0.12),
+            user("00000000-0000-7000-0000-000000000004", "dave", 3, 0.55),
         ];
         s
     }
 
     #[test]
     fn rank_tier_boundaries() {
-        assert_eq!(rank_tier(60), "opal");
-        assert_eq!(rank_tier(50), "opal");
-        assert_eq!(rank_tier(49), "gold");
-        assert_eq!(rank_tier(20), "gold");
-        assert_eq!(rank_tier(19), "silver");
-        assert_eq!(rank_tier(5), "silver");
-        assert_eq!(rank_tier(4), "neutral");
-        assert_eq!(rank_tier(-4), "neutral");
-        assert_eq!(rank_tier(-5), "coal");
-        assert_eq!(rank_tier(-19), "coal");
-        assert_eq!(rank_tier(-20), "trash");
-        assert_eq!(rank_tier(-100), "trash");
+        // The tier comes from the 0-1 rank via the root rank_chart.json
+        // (mineral ladder, one tier per 0.1).
+        assert_eq!(crate::rank_chart::tier_name(0.0), "coal");
+        assert_eq!(crate::rank_chart::tier_name(0.09), "coal");
+        assert_eq!(crate::rank_chart::tier_name(0.1), "copper");
+        assert_eq!(crate::rank_chart::tier_name(0.19), "copper");
+        assert_eq!(crate::rank_chart::tier_name(0.2), "bronze");
+        assert_eq!(crate::rank_chart::tier_name(0.3), "silver");
+        assert_eq!(crate::rank_chart::tier_name(0.45), "gold");
+        assert_eq!(crate::rank_chart::tier_name(0.5), "sapphire");
+        assert_eq!(crate::rank_chart::tier_name(0.66), "emerald");
+        assert_eq!(crate::rank_chart::tier_name(0.75), "ruby");
+        assert_eq!(crate::rank_chart::tier_name(0.85), "diamond");
+        assert_eq!(crate::rank_chart::tier_name(0.9), "opal");
+        assert_eq!(crate::rank_chart::tier_name(1.0), "opal");
     }
 
     #[test]
@@ -1193,7 +1205,7 @@ mod tests {
         // Open a detail and render again.
         w.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &mut stats);
         w.pending_actions.clear();
-        stats.user_detail = Some(user("00000000-0000-7000-0000-000000000001", "alice", 60));
+        stats.user_detail = Some(user("00000000-0000-7000-0000-000000000001", "alice", 60, 0.93));
         stats.user_detail_epoch = stats.user_detail_epoch.wrapping_add(1);
         stats.user_values = vec![crate::db::UserValue {
             key: "notes".to_string(),
