@@ -749,9 +749,14 @@ impl AppState {
         let area = ratatui::layout::Rect { x, y, width, height: list_h };
 
         // Draw a bordered box with the items, current on `> view` highlighted.
+        // The whole dropdown gets an opaque BLACK background so the text is
+        // readable regardless of what pane sits behind it (a transparent
+        // dropdown lets the pane's own text bleed through).
         use ratatui::style::{Color, Style};
         use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+        frame.buffer_mut().set_style(area, Style::default().bg(Color::Black));
+        Clear.render(area, frame.buffer_mut());
         let mut lines: Vec<Line> = Vec::new();
         for (i, v) in items.iter().enumerate() {
             let selected = i == self.dropdown.cursor;
@@ -759,17 +764,17 @@ impl AppState {
             let style = if selected {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::White).bg(Color::Black)
             };
             let mut spans = vec![Span::styled(format!("{} ", marker), style), Span::styled(v.name().to_string(), style)];
             if *v == self.tree.view_at(leaf_id).unwrap_or(crate::bsp::ViewType::Logs) {
-                spans.push(Span::styled(" *", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(" *", Style::default().fg(Color::DarkGray).bg(Color::Black)));
             }
             lines.push(Line::from(spans));
         }
-        lines.push(Line::from(Span::styled("select:  <confirm>", Style::default().fg(Color::DarkGray))));
-        lines.push(Line::from(Span::styled("exit:    <deny>", Style::default().fg(Color::DarkGray))));
-        let block = Block::default().borders(Borders::ALL);
+        lines.push(Line::from(Span::styled("select:  <confirm>", Style::default().fg(Color::DarkGray).bg(Color::Black))));
+        lines.push(Line::from(Span::styled("exit:    <deny>", Style::default().fg(Color::DarkGray).bg(Color::Black))));
+        let block = Block::default().borders(Borders::ALL).style(Style::default().bg(Color::Black));
         Paragraph::new(lines).block(block).render(area, frame.buffer_mut());
     }
 }

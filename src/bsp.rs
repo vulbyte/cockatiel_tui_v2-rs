@@ -117,6 +117,9 @@ pub struct SplitNode {
     pub ratio: f32,
     pub child_a: Box<Node>,
     pub child_b: Box<Node>,
+    /// The divider's own rectangle (the full split region), set by `compute`.
+    /// Its inner edge is what a user drags to resize this split.
+    pub rect: Rect,
 }
 
 /// A leaf: one mounted view, holding its own window + calculated rect.
@@ -152,18 +155,28 @@ pub struct LayoutTree {
     /// Path from the root to the focused leaf (index of child_a/child_b at
     /// each level). Empty when the root itself is a leaf.
     pub focus: Vec<usize>,
-    /// Border-drag state for resizing the focused pane's parent split.
-    pub dragging: Option<DragDir>,
+    /// Border-drag state: the split being resized + which edge of its
+    /// child_a is being dragged. Any divider in the tree is draggable.
+    pub dragging: Option<(Vec<usize>, DragDir)>,
     pub drag_start: Option<(u16, u16)>,
 }
 
-/// Which edge of the focused pane is being dragged to resize the shared split.
+/// Which edge of the dragged divider is being pulled, relative to the split's
+/// child_a side. `Left`/`Top` mean the cursor is on the child_a side of the
+/// divider (growing child_a pulls it right/down); `Right`/`Bottom` the
+/// child_b side (growing child_a pushes the divider toward child_b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragDir {
-    /// Dragging the pane's top edge (resize the parent vertical split).
-    Top,
-    /// Dragging the pane's left edge (resize the parent horizontal split).
+    /// Dragging a horizontal (left/right) split's divider; cursor on the left
+    /// (child_a) side.
     Left,
+    /// Dragging a horizontal split's divider; cursor on the right (child_b) side.
+    Right,
+    /// Dragging a vertical (top/bottom) split's divider; cursor on the top
+    /// (child_a) side.
+    Top,
+    /// Dragging a vertical split's divider; cursor on the bottom (child_b) side.
+    Bottom,
 }
 
 /// Default 5-pane arrangement, mirroring the current fixed grid so the new
@@ -304,6 +317,7 @@ fn split(axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node>) -> Box<Node> {
         ratio,
         child_a: a,
         child_b: b,
+        rect: Rect::default(),
     }))
 }
 
@@ -567,6 +581,7 @@ impl LayoutTree {
             Node::Split(SplitNode {
                 axis,
                 ratio: 0.5,
+                rect: Rect::default(),
                 child_a: Box::new(Node::Leaf(LeafNode {
                     id: a_id,
                     content: LeafContent { view: focused_view, window: make_window(focused_view) },
@@ -605,45 +620,84 @@ impl LayoutTree {
         self.focus = self.path_to_id(id);
     }
 
-    /// Whether a click at `(x, y)` is on the focused leaf's draggable edge
-    /// (its top or left border), and it has a parent split to resize.
-    pub fn focused_drag_edge(&self, x: u16, y: u16) -> Option<DragDir> {
-        if self.focus.len() < 2 {
-            return None; // no parent split to resize
-        }
-        let rect = self.focused_rect()?;
+    /// Whether a click at `(x, y)` is on ANY divider in the tree, and which side
+    /// of it. Returns `(path, dir)` where `path` is the split to resize.
+    /// This makes every sub-window border draggable, not just the focused one.
+    pub fn split_at_point(&self, x: u16, y: u16) -> Option<(Vec<usize>, DragDir)> {
         let threshold = 1;
-        // Top edge: y within 1 of rect.y, x within the leaf's horizontal span.
-        if y >= rect.y.saturating_sub(threshold) && y <= rect.y + threshold
-            && x >= rect.x && x <= rect.x + rect.width
-        {
-            return Some(DragDir::Top);
-        }
-        // Left edge: x within 1 of rect.x, y within the leaf's vertical span.
-        if x >= rect.x.saturating_sub(threshold) && x <= rect.x + threshold
-            && y >= rect.y && y <= rect.y + rect.height
-        {
-            return Some(DragDir::Left);
+        let mut stack: Vec<(Vec<usize>, &Node)> = vec![(Vec::new(), &self.root)];
+        while let Some((path, node)) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    let rect = s.rect;
+                    let (a_rect, _) = split_rects(s.axis, s.ratio, rect);
+                    // The divider runs along the child_a edge.
+                    let on_divider = match s.axis {
+                        Axis::Horizontal => {
+                            let divider_x = a_rect.x + a_rect.width;
+                            x >= divider_x.saturating_sub(threshold) && x <= divider_x + threshold
+                                && y >= rect.y && y <= rect.y + rect.height
+                        }
+                        Axis::Vertical => {
+                            let divider_y = a_rect.y + a_rect.height;
+                            y >= divider_y.saturating_sub(threshold) && y <= divider_y + threshold
+                                && x >= rect.x && x <= rect.x + rect.width
+                        }
+                    };
+                    if on_divider {
+                        let dir = match s.axis {
+                            Axis::Horizontal => if x < a_rect.x + a_rect.width { DragDir::Left } else { DragDir::Right },
+                            Axis::Vertical => if y < a_rect.y + a_rect.height { DragDir::Top } else { DragDir::Bottom },
+                        };
+                        return Some((path, dir));
+                    }
+                    // Recurse into children in case the click is on an inner divider.
+                    let mut pa = path.clone();
+                    pa.push(0);
+                    let mut pb = path.clone();
+                    pb.push(1);
+                    stack.push((pb, &s.child_b));
+                    stack.push((pa, &s.child_a));
+                }
+                Node::Leaf(_) => {}
+            }
         }
         None
     }
 
-    /// Update the focused pane's parent split ratio from a mouse drag, using
-    /// the drag-start point to derive the direction/magnitude.
-    pub fn update_from_drag(&mut self, dir: DragDir, x: u16, y: u16) {
-        let (start_x, start_y) = self.drag_start.unwrap_or((x, y));
-        let delta = match dir {
-            DragDir::Top => {
-                // Positive when dragging down (grows the top child).
-                let dy = i32::from(y) - i32::from(start_y);
-                dy as f32 / 200.0
+    /// Move the divider of the split at `path` by `delta` (fraction of the
+    /// split's full extent; positive grows child_a). Clamped to 0.05..0.95.
+    pub fn resize_split(&mut self, path: &[usize], delta: f32) -> bool {
+        if let Node::Split(s) = leaf_at_mut(&mut self.root, path) {
+            let new_ratio = (s.ratio + delta).clamp(0.05, 0.95);
+            if (new_ratio - s.ratio).abs() < f32::EPSILON {
+                return false;
             }
-            DragDir::Left => {
+            s.ratio = new_ratio;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update a split drag from mouse movement. The drag target is stored in
+    /// `self.dragging`; movement magnitude is scaled by the split's extent.
+    pub fn update_split_drag(&mut self, x: u16, y: u16) {
+        let Some((path, dir)) = self.dragging.clone() else { return };
+        let (start_x, start_y) = self.drag_start.unwrap_or((x, y));
+        // Dragging a divider right or down ALWAYS grows child_a (the left/top
+        // pane), regardless of which side of the divider the cursor grabbed.
+        let delta = match dir {
+            DragDir::Left | DragDir::Right => {
                 let dx = i32::from(x) - i32::from(start_x);
                 dx as f32 / 200.0
             }
+            DragDir::Top | DragDir::Bottom => {
+                let dy = i32::from(y) - i32::from(start_y);
+                dy as f32 / 200.0
+            }
         };
-        let _ = self.resize_focused(delta);
+        let _ = self.resize_split(&path, delta);
         self.drag_start = Some((x, y));
     }
 
@@ -763,6 +817,7 @@ fn uuid_fragment() -> String {
 fn compute_node(node: &mut Node, rect: Rect) {
     match node {
         Node::Split(s) => {
+            s.rect = rect;
             let (a, b) = split_rects(s.axis, s.ratio, rect);
             compute_node(&mut s.child_a, a);
             compute_node(&mut s.child_b, b);
@@ -1006,6 +1061,25 @@ mod tests {
         let parent = t.split_at(&t.focus[..t.focus.len() - 1]);
         let (_, ratio) = parent.unwrap();
         assert!(ratio >= 0.05 && ratio < 0.6, "ratio moved and stayed clamped");
+    }
+
+    #[test]
+    fn any_divider_is_draggable_not_just_the_focused_pane() {
+        let mut t = tree_3();
+        t.compute(Rect { x: 0, y: 0, width: 120, height: 40 });
+        // The default tree splits the screen left(30%)/right at x=36. Clicking
+        // near x=36 must hit the root divider even when focus is elsewhere.
+        t.focus = t.path_to_id("graph");
+        let hit = t.split_at_point(36, 20);
+        assert!(hit.is_some(), "the root divider must be draggable anywhere");
+        let (path, dir) = hit.unwrap();
+        assert_eq!(path, Vec::<usize>::new(), "the root split is at path []");
+        assert_eq!(dir, crate::bsp::DragDir::Right);
+        // Dragging it moves the ratio.
+        t.dragging = Some((path, dir));
+        t.drag_start = Some((36, 20));
+        t.update_split_drag(60, 20);
+        assert!(t.split_at(&[]).map(|(_, r)| r).unwrap() > 0.30, "dragging right grew child_a");
     }
 
     #[test]

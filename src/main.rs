@@ -1489,19 +1489,16 @@ async fn handle_input_event(
                         }
                     }
 
-                    // Start drag if the click is on the focused leaf's parent split edge.
-                    // A pane's borders are its computed rect edges; dragging
-                    // from within the leaf near its left/top edge resizes the
-                    // shared split. (Simplest robust rule: drag from the
-                    // focused leaf's own edge region.)
-                    if let Some(edge) = state.tree.focused_drag_edge(mouse.column, mouse.row) {
-                        state.tree.dragging = Some(edge);
+                    // Start a drag if the click is on ANY divider in the tree — every
+                    // sub-window's border is draggable, in both axes.
+                    if let Some((path, dir)) = state.tree.split_at_point(mouse.column, mouse.row) {
+                        state.tree.dragging = Some((path, dir));
                         state.tree.drag_start = Some((mouse.column, mouse.row));
                     }
                 }
                 crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                    if let Some(edge) = state.tree.dragging {
-                        state.tree.update_from_drag(edge, mouse.column, mouse.row);
+                    if state.tree.dragging.is_some() {
+                        state.tree.update_split_drag(mouse.column, mouse.row);
                         state.force_full_redraw = true;
                     }
                 }
