@@ -86,6 +86,14 @@ pub enum Action {
 
 #[derive(Debug, Deserialize)]
 struct HotkeyFile {
+    /// New schema (the NEW_UI spec): the global bindings.
+    #[serde(default)]
+    global_context: HashMap<String, String>,
+    /// New schema: the window/pane-management bindings (split/join/etc.).
+    #[serde(default)]
+    window_management: HashMap<String, String>,
+    /// Legacy schema (kept for backward compat): the nav section.
+    #[serde(default)]
     nav: HashMap<String, String>,
     #[serde(default)]
     modules: HashMap<String, String>,
@@ -223,6 +231,23 @@ pub fn load_hotkeys(path: &PathBuf) -> HotkeyConfig {
     for (key, action) in &file.nav {
         if let Some(k) = parse_key(key) {
             cfg.global.insert(k, parse_action(action));
+        }
+    }
+
+    // New schema: `global_context` overlays the same global map as `nav`.
+    for (key, action) in &file.global_context {
+        if let Some(k) = parse_key(key) {
+            cfg.global.insert(k, parse_action(action));
+        }
+    }
+
+    // New schema: `window_management` lands in a "panes" window-action group.
+    for (key, action) in &file.window_management {
+        if let Some(k) = parse_key(key) {
+            cfg.window_actions
+                .entry("panes".to_string())
+                .or_default()
+                .insert(k, parse_action(action));
         }
     }
 
@@ -424,7 +449,7 @@ fn render_labels_primary(
 impl HotkeyConfig {
     /// Global (nav) bindings as `<command>:[<keys>], ...`.
     pub fn format_global(&self) -> String {
-        format_bindings(&self.global, &["quit", "window-next", "window-prev"])
+        format_bindings(&self.global, &["quit", "window-next", "split-v", "split-h", "join"])
     }
 
     /// A subset of the global (nav) bindings, by label, as `<command>:[<keys>]`.
@@ -574,6 +599,44 @@ pub fn default_hotkeys() -> HotkeyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_keymap_schema_loads() {
+        // The NEW_UI spec schema: global_context + window_management.
+        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hotkey_config.json");
+        std::fs::write(&path, r#"{
+            "global_context": {
+                "Tab": "FocusNext",
+                "Ctrl+v": "SplitVertical",
+                "Ctrl+h": "SplitHorizontal",
+                "Ctrl+w": "JoinPanes"
+            },
+            "window_management": {
+                "Ctrl+t": "FocusNext"
+            }
+        }"#).unwrap();
+        let cfg = load_hotkeys(&path);
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Some(&Action::SplitVertical)
+        );
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Some(&Action::SplitHorizontal)
+        );
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Some(&Action::JoinPanes)
+        );
+        // window_management landed in the "panes" group.
+        assert!(
+            cfg.window_actions.get("panes").is_some(),
+            "window_management must populate the panes group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn e_binds_editconfig_and_defaults_survive_the_file() {
