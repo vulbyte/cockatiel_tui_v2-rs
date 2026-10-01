@@ -304,9 +304,26 @@ impl LayoutTree {
         }
     }
 
+    /// If the node at `path` is a Split, its (axis, ratio) — no borrow held.
+    pub fn split_at(&self, path: &[usize]) -> Option<(Axis, f32)> {
+        match leaf_at(&self.root, path) {
+            Node::Split(s) => Some((s.axis, s.ratio)),
+            Node::Leaf(_) => None,
+        }
+    }
+
+    /// If the node at `path` is a Leaf, its (id, view, is_focused) — no borrow
+    /// held.
+    pub fn leaf_info_at(&self, path: &[usize]) -> Option<(String, ViewType, bool)> {
+        match leaf_at(&self.root, path) {
+            Node::Leaf(l) => Some((l.id.clone(), l.content.view, path == self.focus.as_slice())),
+            Node::Split(_) => None,
+        }
+    }
+
     /// Find the first leaf whose view maps to `id`, returning an immutable
     /// window reference.
-    pub fn window_by_id(&self, id: WindowId) -> Option<&Box<dyn Window>> {
+    pub fn window_by_id(&self, id: WindowId) -> Option<&dyn Window> {
         let mut stack: Vec<&Node> = vec![&self.root];
         while let Some(node) = stack.pop() {
             match node {
@@ -316,7 +333,7 @@ impl LayoutTree {
                 }
                 Node::Leaf(l) => {
                     if l.content.view.window_id() == id {
-                        return Some(&l.content.window);
+                        return Some(l.content.window.as_ref());
                     }
                 }
             }
@@ -365,6 +382,65 @@ impl LayoutTree {
     /// Whether any leaf hosts the given view (by its WindowId).
     pub fn has_view(&self, id: WindowId) -> bool {
         self.leaves().iter().any(|(_, v, _, _)| v.window_id() == id)
+    }
+
+    /// The calculated rectangle of a leaf by id.
+    pub fn leaf_rect_by_id(&self, id: &str) -> Option<Rect> {
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&s.child_b);
+                    stack.push(&s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if l.id == id {
+                        return Some(l.rect);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The view currently mounted in a leaf by id.
+    pub fn view_at(&self, id: &str) -> Option<ViewType> {
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&s.child_b);
+                    stack.push(&s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if l.id == id {
+                        return Some(l.content.view);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Swap a leaf's view by its id (the dropdown's action). The old window
+    /// state is dropped and a fresh one mounts.
+    pub fn swap_view_by_id(&mut self, id: &str, new_view: ViewType) {
+        let mut stack: Vec<&mut Node> = vec![&mut self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Split(s) => {
+                    stack.push(&mut s.child_b);
+                    stack.push(&mut s.child_a);
+                }
+                Node::Leaf(l) => {
+                    if l.id == id {
+                        l.content.view = new_view;
+                        l.content.window = make_window(new_view);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// Split the focused leaf along `axis`. Returns false (and changes nothing)
@@ -433,6 +509,11 @@ impl LayoutTree {
             Node::Split(_) => None,
         };
         old
+    }
+
+    /// Move focus to the leaf with the given id.
+    pub fn set_focus_to(&mut self, id: &str) {
+        self.focus = self.path_to_id(id);
     }
 
     /// Move focus to the next leaf in tree order (used by Tab / FocusNext).

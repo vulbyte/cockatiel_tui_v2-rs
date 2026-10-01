@@ -1193,10 +1193,45 @@ async fn handle_input_event(
                 }
             }
 
+            // The view-type dropdown (per-pane `[v]` menu) owns the keyboard
+            // while it is open: arrows move, confirm swaps the view, deny/esc
+            // closes without changing anything.
+            if state.dropdown.is_open() {
+                match key.code {
+                    KeyCode::Up => { state.dropdown.cursor_up(); return Ok(false); }
+                    KeyCode::Down => { state.dropdown.cursor_down(); return Ok(false); }
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        let choice = crate::bsp::ViewType::all()[state.dropdown.cursor];
+                        let target = state.dropdown.open_for.clone();
+                        state.dropdown.close();
+                        if let Some(leaf_id) = target {
+                            state.tree.swap_view_by_id(&leaf_id, choice);
+                            state.sync_active_window();
+                            state.force_full_redraw = true;
+                        }
+                        return Ok(false);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        state.dropdown.close();
+                        return Ok(false);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+
             // Ctrl+L: force a full repaint on the next frame. The automatic
             // shape-change repaint covers layout/editor/focus transitions, so
             // this is the manual escape hatch for anything it misses.
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+                state.force_full_redraw = true;
+                return Ok(false);
+            }
+
+            // Ctrl+T: open the view-type dropdown for the focused pane.
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                let leaf_id = state.tree.focused_id();
+                let view = state.tree.focused_view();
+                state.dropdown.open(&leaf_id, view);
                 state.force_full_redraw = true;
                 return Ok(false);
             }
@@ -1392,23 +1427,22 @@ async fn handle_input_event(
                         }
                     }
 
-                    // Focus-on-click: map click to window area
-                    let areas = state.layout.compute(full_area);
-                    let click_rect = Rect { x: mouse.column, y: mouse.row, width: 1, height: 1 };
-                    let clicked_window = [
-                        (WindowId::Logo, areas.logo),
-                        (WindowId::Log, areas.log),
-                        (WindowId::Modules, areas.modules),
-                        (WindowId::Chart, areas.chart),
-                        (WindowId::Prompts, areas.prompts),
-                    ].iter().find(|(_, area)| area.intersects(click_rect)).map(|(id, _)| *id);
+                    // Focus-on-click: map click to the leaf whose computed rect contains it.
+                    let (leaf_id, is_header) = match state.leaf_at_point(mouse.column, mouse.row) {
+                        Some(hit) => hit,
+                        None => (String::new(), false),
+                    };
 
-                    if let Some(window_id) = clicked_window {
-                        // Only focus windows that actually exist (a detached
-                        // child has a single window; the layout sub-rects of
-                        // the other ids must not steal focus).
-                        if state.tree.has_view(window_id) {
-                            state.active_window = window_id;
+                    if !leaf_id.is_empty() {
+                        // Focus this leaf.
+                        state.tree.set_focus_to(&leaf_id);
+                        state.sync_active_window();
+                        // Clicking the `[v]` header opens that pane's dropdown.
+                        if is_header {
+                            if let Some(view) = state.tree.view_at(&leaf_id) {
+                                state.dropdown.open(&leaf_id, view);
+                                state.force_full_redraw = true;
+                            }
                         }
                     }
 

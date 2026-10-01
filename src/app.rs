@@ -50,10 +50,6 @@ pub enum WindowId {
 }
 
 impl WindowId {
-    pub fn all() -> &'static [WindowId] {
-        &[WindowId::Logo, WindowId::Log, WindowId::Modules, WindowId::Chart, WindowId::Prompts]
-    }
-
     pub fn name(&self) -> &'static str {
         match self {
             WindowId::Logo => "logo",
@@ -194,11 +190,52 @@ pub struct ScreenShape {
     pub prompt_count: usize,
 }
 
+/// State for the per-pane view dropdown (the `[v] view_type` header menu).
+#[derive(Debug, Clone, Default)]
+pub struct DropdownState {
+    /// Whether the dropdown is open, and for which leaf id.
+    pub open_for: Option<String>,
+    /// The cursor row within the view-type list.
+    pub cursor: usize,
+}
+
+impl DropdownState {
+    /// Open the dropdown for `leaf_id`, keeping the cursor on the leaf's
+    /// current view.
+    pub fn open(&mut self, leaf_id: &str, current: crate::bsp::ViewType) {
+        let idx = crate::bsp::ViewType::all().iter().position(|v| *v == current).unwrap_or(0);
+        self.open_for = Some(leaf_id.to_string());
+        self.cursor = idx;
+    }
+
+    pub fn close(&mut self) {
+        self.open_for = None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open_for.is_some()
+    }
+
+    /// Move the cursor up one, wrapping.
+    pub fn cursor_up(&mut self) {
+        let n = crate::bsp::ViewType::all().len();
+        self.cursor = if self.cursor == 0 { n - 1 } else { self.cursor - 1 };
+    }
+
+    /// Move the cursor down one, wrapping.
+    pub fn cursor_down(&mut self) {
+        let n = crate::bsp::ViewType::all().len();
+        self.cursor = (self.cursor + 1) % n;
+    }
+}
+
 pub struct AppState {
     pub active_window: WindowId,
     /// The BSP layout tree: the source of truth for mounted windows. Each leaf
     /// owns its view's `Box<dyn Window>`; `windows` is gone (was the flat vec).
     pub tree: crate::bsp::LayoutTree,
+    /// Open view-type dropdown state (the `[v] view_type` header menu).
+    pub dropdown: DropdownState,
     /// The configured terminal emulator (from the TUI's config.json
     /// `terminal_emulator` key). Empty/None = the system default. Used to open
     /// terminal modules and pop-out windows.
@@ -333,6 +370,7 @@ impl AppState {
         Self {
             active_window: tree.focused_view().window_id(),
             tree,
+            dropdown: DropdownState::default(),
             terminal_emulator: None,
             force_full_redraw: false,
             stats: GlobalStats::default(),
@@ -441,40 +479,14 @@ impl AppState {
     pub fn handle_global_key(&mut self, key: KeyEvent) -> Option<Action> {
         if let Some(action) = self.hotkeys.global.get(&key) {
             match action {
-                Action::FocusLeft => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let prev = if idx == 0 { WindowId::all().len() - 1 } else { idx - 1 };
-                    self.active_window = WindowId::all()[prev];
+                Action::FocusLeft | Action::FocusUp | Action::FocusPrev => {
+                    self.tree.focus_prev();
+                    self.sync_active_window();
                     return Some(Action::Noop);
                 }
-                Action::FocusRight => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let next = (idx + 1) % WindowId::all().len();
-                    self.active_window = WindowId::all()[next];
-                    return Some(Action::Noop);
-                }
-                Action::FocusDown => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let next = (idx + 1) % WindowId::all().len();
-                    self.active_window = WindowId::all()[next];
-                    return Some(Action::Noop);
-                }
-                Action::FocusUp => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let prev = if idx == 0 { WindowId::all().len() - 1 } else { idx - 1 };
-                    self.active_window = WindowId::all()[prev];
-                    return Some(Action::Noop);
-                }
-                Action::FocusNext => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let next = (idx + 1) % WindowId::all().len();
-                    self.active_window = WindowId::all()[next];
-                    return Some(Action::Noop);
-                }
-                Action::FocusPrev => {
-                    let idx = WindowId::all().iter().position(|w| *w == self.active_window).unwrap_or(0);
-                    let prev = if idx == 0 { WindowId::all().len() - 1 } else { idx - 1 };
-                    self.active_window = WindowId::all()[prev];
+                Action::FocusRight | Action::FocusDown | Action::FocusNext => {
+                    self.tree.focus_next();
+                    self.sync_active_window();
                     return Some(Action::Noop);
                 }
                 Action::Quit => return Some(Action::Quit),
@@ -500,9 +512,24 @@ impl AppState {
         self.active_window = self.tree.focused_view().window_id();
     }
 
+    /// The leaf whose rectangle contains `(x, y)`, if any. Leaves are checked
+    /// against their computed rects (the header row is row `rect.y`).
+    pub fn leaf_at_point(&self, x: u16, y: u16) -> Option<(String, bool)> {
+        // Returns (leaf_id, is_header): is_header = the click was on row 0 of
+        // that leaf (the `[v] view_type` strip).
+        for (id, _, rect, _) in self.tree.leaves() {
+            if rect.intersects(ratatui::layout::Rect { x, y, width: 1, height: 1 }) {
+                return Some((id, y == rect.y));
+            }
+        }
+        None
+    }
+
     /// Compute the BSP layout and render every leaf into `frame`.
     ///
     /// `single` = detached pop-out mode: one leaf takes the full main area.
+    /// Each leaf renders a 1-row `[v] view_type` header strip above its window;
+    /// the dropdown, when open, is drawn as an overlay on top.
     pub fn render_windows(
         &mut self,
         frame: &mut ratatui::Frame,
@@ -510,18 +537,16 @@ impl AppState {
         single: bool,
     ) {
         self.tree.compute(size);
-        let focused_id = self.tree.focused_id();
         // Collect the leaf windows + rects first so the borrow of `self.tree`
         // (immutable for rects) and the mutable per-window render don't clash.
         // We render through a DFS that finds each leaf by path.
         let mut stack: Vec<(Vec<usize>, ratatui::layout::Rect)> = vec![(vec![], size)];
         while let Some((path, area)) = stack.pop() {
-            // Walk to the node at `path` to learn its shape.
-            let node = crate::bsp::leaf_at(&self.tree.root, &path);
-            match node {
-                crate::bsp::Node::Split(s) => {
-                    // compute the two child rects from `area` + the split ratio
-                    let (a_rect, b_rect) = crate::bsp::split_rects(s.axis, s.ratio, area);
+            // Ask the tree what is at this path WITHOUT keeping a borrow, so we
+            // can later take the leaf's window mutably.
+            match self.tree.split_at(&path) {
+                Some((axis, ratio)) => {
+                    let (a_rect, b_rect) = crate::bsp::split_rects(axis, ratio, area);
                     let mut pa = path.clone();
                     pa.push(0);
                     let mut pb = path.clone();
@@ -529,7 +554,8 @@ impl AppState {
                     stack.push((pb, b_rect));
                     stack.push((pa, a_rect));
                 }
-                crate::bsp::Node::Leaf(l) => {
+                None => {
+                    // A leaf (or empty): render its window into the area.
                     let area = if single {
                         ratatui::layout::Rect {
                             x: size.x,
@@ -540,14 +566,34 @@ impl AppState {
                     } else {
                         area
                     };
-                    let is_active = !single && l.id == focused_id;
+                    let (id, view, is_active) = match self.tree.leaf_info_at(&path) {
+                        Some(info) => info,
+                        None => continue,
+                    };
+
+                    // Reserve a 1-row header for the `[v] view_type` strip.
+                    let (header_area, content_area) = if area.height >= 2 {
+                        (
+                            ratatui::layout::Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+                            ratatui::layout::Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 },
+                        )
+                    } else {
+                        (ratatui::layout::Rect::default(), area)
+                    };
+
+                    if header_area.height == 1 {
+                        self.render_pane_header(frame, header_area, &id, view, is_active);
+                    }
+
+                    // Take the window only after the header render, so the
+                    // immutable `self` borrow is done.
                     let window = match self.tree.window_mut_by_path(&path) {
                         Some(w) => w,
                         None => continue,
                     };
                     window.set_prompt_selected(self.selected_prompt);
                     window.render(
-                        area,
+                        content_area,
                         frame.buffer_mut(),
                         is_active,
                         &self.stats,
@@ -558,6 +604,79 @@ impl AppState {
                 }
             }
         }
+
+        // Draw the open dropdown as an overlay, last so it sits on top.
+        if !single {
+            self.render_dropdown(frame, size);
+        }
+    }
+
+    /// Render a leaf's `[v] view_type` header strip.
+    fn render_pane_header(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        _leaf_id: &str,
+        view: crate::bsp::ViewType,
+        is_active: bool,
+    ) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Paragraph, Widget};
+        let bg = if is_active { Color::Cyan } else { Color::DarkGray };
+        let text = Line::from(vec![
+            Span::styled(" [v] ", Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", view.name()), Style::default().fg(Color::Black).bg(bg)),
+        ]);
+        Paragraph::new(text).render(area, frame.buffer_mut());
+    }
+
+    /// Render the open view-type dropdown, positioned 1 line below the focused
+    /// leaf's header, shifted left if it would go off-screen.
+    fn render_dropdown(&self, frame: &mut ratatui::Frame, _size: ratatui::layout::Rect) {
+        let Some(leaf_id) = &self.dropdown.open_for else { return };
+        let Some(rect) = self.tree.leaf_rect_by_id(leaf_id) else { return };
+        let items = crate::bsp::ViewType::all();
+
+        // The dropdown sits one line below the header, at the leaf's left edge.
+        // Compute its width from the longest view name (with padding).
+        let list_h = items.len() as u16 + 2; // items + select/exit footer (2 rows)
+        let mut width = 12u16;
+        for v in items {
+            width = width.max(v.name().len() as u16 + 4);
+        }
+        // Plus the footer's width.
+        width = width.max("select:  <confirm> ".len() as u16 + 4);
+
+        let x = rect.x;
+        // Shift left if the dropdown would run off the right edge.
+        let x = x.saturating_add(width).min(_size.width).saturating_sub(width).min(x);
+        let y = rect.y + 1;
+        let area = ratatui::layout::Rect { x, y, width, height: list_h };
+
+        // Draw a bordered box with the items, current on `> view` highlighted.
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, v) in items.iter().enumerate() {
+            let selected = i == self.dropdown.cursor;
+            let marker = if selected { ">" } else { " " };
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut spans = vec![Span::styled(format!("{} ", marker), style), Span::styled(v.name().to_string(), style)];
+            if *v == self.tree.view_at(leaf_id).unwrap_or(crate::bsp::ViewType::Logs) {
+                spans.push(Span::styled(" *", Style::default().fg(Color::DarkGray)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled("select:  <confirm>", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("exit:    <deny>", Style::default().fg(Color::DarkGray))));
+        let block = Block::default().borders(Borders::ALL);
+        Paragraph::new(lines).block(block).render(area, frame.buffer_mut());
     }
 }
 
@@ -572,6 +691,39 @@ mod tests {
             crate::colors::load_colors(&std::path::PathBuf::from("")),
             crate::hotkeys::default_hotkeys(),
         )
+    }
+
+    #[test]
+    fn dropdown_opens_on_the_current_view_and_moves() {
+        let mut d = DropdownState::default();
+        assert!(!d.is_open());
+        d.open("leaf-1", crate::bsp::ViewType::Logs);
+        assert!(d.is_open());
+        // Cursor starts on the leaf's current view.
+        let idx = crate::bsp::ViewType::all().iter().position(|v| *v == crate::bsp::ViewType::Logs).unwrap();
+        assert_eq!(d.cursor, idx);
+        // Moves wrap around.
+        d.cursor_down();
+        assert_eq!(d.cursor, (idx + 1) % crate::bsp::ViewType::all().len());
+        d.cursor_up();
+        assert_eq!(d.cursor, idx);
+        d.close();
+        assert!(!d.is_open());
+    }
+
+    #[test]
+    fn leaf_at_point_returns_header_flag() {
+        let mut s = state();
+        s.tree.compute(ratatui::layout::Rect { x: 0, y: 0, width: 120, height: 40 });
+        // The info leaf is the top-left; its header is row 0.
+        let hit = s.leaf_at_point(5, 0);
+        assert!(hit.is_some());
+        let (_, is_header) = hit.unwrap();
+        assert!(is_header, "row 0 of a leaf is its header strip");
+        let hit_body = s.leaf_at_point(5, 5);
+        assert!(hit_body.is_some());
+        let (_, is_header) = hit_body.unwrap();
+        assert!(!is_header, "a row below the header is not the header");
     }
 
     #[test]
