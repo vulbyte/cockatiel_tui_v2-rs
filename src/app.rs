@@ -361,15 +361,15 @@ pub const CRASH_WINDOW_MS: i64 = 30 * 60 * 1000;
 /// Consecutive crashes before the "disable autostart?" prompt appears.
 pub const CONSECUTIVE_CRASH_PROMPT: u32 = 3;
 /// Cap for the exponential crash-restart backoff (10 minutes).
-pub const CRASH_BACKOFF_MAX_SECS: u64 = 600;
+pub const CRASH_BACKOFF_MAX_SECS: u32 = 600;
 
 /// Exponential crash-restart backoff: 1s, 2s, 4s, 8s ... capped at
 /// `CRASH_BACKOFF_MAX_SECS` (10 min). `consecutive` is the module's crash
 /// count within the current window (from `ModuleCrashState::record_crash`).
 pub fn crash_backoff(consecutive: u32) -> Duration {
     let shift = (consecutive.saturating_sub(1)).min(10);
-    let secs = (1u64 << shift).min(CRASH_BACKOFF_MAX_SECS);
-    Duration::from_secs(secs)
+    let secs = (1u32 << shift).min(CRASH_BACKOFF_MAX_SECS);
+    Duration::from_secs(secs as u64)
 }
 
 impl AppState {
@@ -473,7 +473,7 @@ impl AppState {
     /// loop's `redraw` ticker fires every 100ms, so 6 ticks ≈ 0.6s per phase
     /// (a ~0.8Hz flash: slow enough to read as text, fast enough to catch out
     /// of the corner of your eye).
-    pub const PAUSE_FLASH_TICKS: u64 = 6;
+    pub const PAUSE_FLASH_TICKS: u32 = 6;
 
     /// Whether the PAUSED indicator is in its visible phase for redraw `tick`.
     ///
@@ -484,7 +484,7 @@ impl AppState {
     /// already produces a frame every 100ms, so the flash rides that repaint
     /// tick for free. Folding the phase into the shape would instead clear and
     /// repaint the ENTIRE terminal twice a second to change a few characters.
-    pub fn pause_flash_on(tick: u64) -> bool {
+    pub fn pause_flash_on(tick: u32) -> bool {
         (tick / Self::PAUSE_FLASH_TICKS).is_multiple_of(2)
     }
 
@@ -881,8 +881,8 @@ mod tests {
         assert_eq!(crash_backoff(4), Duration::from_secs(8));
         assert_eq!(crash_backoff(10), Duration::from_secs(512));
         // Capped at 10 minutes, never grows further.
-        assert_eq!(crash_backoff(11), Duration::from_secs(CRASH_BACKOFF_MAX_SECS));
-        assert_eq!(crash_backoff(20), Duration::from_secs(CRASH_BACKOFF_MAX_SECS));
+        assert_eq!(crash_backoff(11), Duration::from_secs(CRASH_BACKOFF_MAX_SECS as u64));
+        assert_eq!(crash_backoff(20), Duration::from_secs(CRASH_BACKOFF_MAX_SECS as u64));
     }
 
     #[test]

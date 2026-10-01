@@ -95,9 +95,9 @@ impl ChartWindow {
         }
 
         // Find max value for normalization
-        let mut max_val: u64 = 0;
+        let mut max_val: u32 = 0;
         for bucket in &stats.chart_data {
-            let total: u64 = bucket.counts.iter()
+            let total: u32 = bucket.counts.iter()
                 .filter(|(p, _)| self.visible_platforms.get(*p).copied().unwrap_or(true))
                 .map(|(_, c)| *c)
                 .sum();
@@ -119,22 +119,22 @@ impl ChartWindow {
 
         // Sample data points to fit width
         let step = if stats.chart_data.len() > chart_width {
-            (stats.chart_data.len() as f64 / chart_width as f64).ceil() as usize
+            (stats.chart_data.len() as f32 / chart_width as f32).ceil() as usize
         } else {
             1
         };
 
         // Build rows from top to bottom
         for row in 0..chart_height {
-            let threshold = max_val as f64 * (1.0 - row as f64 / chart_height as f64);
+            let threshold = max_val as f32 * (1.0 - row as f32 / chart_height as f32);
             let mut spans = vec![Span::styled("  ", Style::default())];
 
             for col in 0..chart_width {
                 let data_idx = (col * step).min(stats.chart_data.len().saturating_sub(1));
                 let bucket = &stats.chart_data[data_idx];
 
-                let mut y_val: u64 = 0;
-                let mut platforms: Vec<(&String, &u64)> = bucket.counts.iter()
+                let mut y_val: u32 = 0;
+                let mut platforms: Vec<(&String, &u32)> = bucket.counts.iter()
                     .filter(|(p, _)| self.visible_platforms.get(*p).copied().unwrap_or(true))
                     .collect();
                 platforms.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
@@ -142,7 +142,7 @@ impl ChartWindow {
                 let mut found = false;
                 for (platform, count) in &platforms {
                     y_val += *count;
-                    if y_val as f64 >= threshold {
+                    if y_val as f32 >= threshold {
                         let color = colors.platform_color(platform);
                         spans.push(Span::styled("█", Style::default().fg(color)));
                         found = true;

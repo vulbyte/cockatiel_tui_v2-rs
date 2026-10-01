@@ -64,13 +64,13 @@ pub const DETACHED_GIVE_UP_AFTER: u32 = 5;
 
 /// Delay before reconnecting after `attempt` consecutive failures: 3s, 6s, 12s,
 /// 24s, then capped at 30s. Pure so the curve is testable.
-pub fn reconnect_backoff_secs(attempt: u32) -> u64 {
+pub fn reconnect_backoff_secs(attempt: u32) -> u32 {
     if attempt == 0 {
         return 3;
     }
     // Shift is bounded so the doubling cannot overflow, and the result is capped
     // at 30s: past that, waiting longer buys nothing.
-    (3u64 << attempt.min(4)).min(30)
+    (3u32 << attempt.min(4)).min(30)
 }
 
 impl WsClient {
@@ -171,7 +171,7 @@ impl WsClient {
             // a log line every 3 seconds for as long as it lasts.
             tokio::time::sleep(Duration::from_secs(reconnect_backoff_secs(
                 consecutive_failures,
-            )))
+            ) as u64))
             .await;
         }
     }
@@ -661,7 +661,7 @@ mod reconnect_tests {
         // One failure is not enough evidence the parent is gone (a restart race
         // is normal), so the budget has to allow several attempts — but the total
         // time spent must stay short enough that a real orphan does not linger.
-        let total: u64 = (1..=DETACHED_GIVE_UP_AFTER)
+        let total: u32 = (1..=DETACHED_GIVE_UP_AFTER)
             .map(reconnect_backoff_secs)
             .sum();
         assert!(total <= 120, "gave up after {total}s, too slow");

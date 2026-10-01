@@ -40,7 +40,7 @@ enum DialogMode {
     Reprimand,
     Ban,
     TimeoutDuration,
-    TimeoutReason { duration_secs: i64 },
+    TimeoutReason { duration_secs: i32 },
     Delete,
     Notes,
 }
@@ -281,7 +281,7 @@ impl UsersWindow {
                         serde_json::json!({ "uuid7": uuid7, "reason": input }).to_string(),
                     ),
                     DialogMode::TimeoutDuration => {
-                        let duration: i64 = input.trim().parse().unwrap_or(300).max(1);
+                        let duration: i32 = input.trim().parse().unwrap_or(300).max(1);
                         // Phase 2: reason.
                         self.dialog = Some(Dialog {
                             title: "timeout".into(),
@@ -598,7 +598,7 @@ impl UsersWindow {
                     if let Some(ms) = val.get("expires_at_ms").and_then(|x| x.as_i64()) {
                         parts.push(format!("expires={}s", ms.saturating_sub(now_ms()) / 1000));
                     }
-                    if let Some(secs) = val.get("duration_secs").and_then(|x| x.as_i64()) {
+                    if let Some(secs) = val.get("duration_secs").and_then(|x| x.as_i64()).map(|x| x as i32) {
                         parts.push(format!("{}s", secs));
                     }
                     if let Some(r) = val.get("reason").and_then(|x| x.as_str()) {
@@ -741,7 +741,7 @@ impl Window for UsersWindow {
         let inner = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
         let content_height = inner.height.saturating_sub(2); // hotkey + filter/error rows
 
-        let list_width = (((inner.width as f64) * 0.45) as u16)
+        let list_width = (((inner.width as f32) * 0.45) as u16)
             .max(24)
             .min(inner.width.saturating_sub(10));
         let list_area = Rect { x: inner.x, y: inner.y, width: list_width, height: content_height };
@@ -1003,7 +1003,7 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
     }
 
-    fn user(uuid: &str, name: &str, score: i64, rank: f32) -> UserSummary {
+    fn user(uuid: &str, name: &str, score: i32, rank: f32) -> UserSummary {
         UserSummary {
             uuid7: uuid.to_string(),
             username: name.to_string(),

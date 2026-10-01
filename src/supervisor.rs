@@ -2561,7 +2561,7 @@ mod tests {
             build_command: Some("cargo".into()),
             build_flags: vec!["build".into(), "--release".into()],
             price: 0,
-            min_rank: 0,
+            min_rank: 0.0,
             authority: crate::plugins::default_authority(),
         };
         (Plugin { manifest, directory: dir }, bin_path)
@@ -2623,7 +2623,7 @@ mod tests {
             build_command: None,
             build_flags: vec![],
             price: 0,
-            min_rank: 0,
+            min_rank: 0.0,
             authority: crate::plugins::default_authority(),
         };
         let p = Plugin {
@@ -2934,7 +2934,7 @@ mod tests {
             build_command: None,
             build_flags: vec![],
             price: 0,
-            min_rank: 0,
+            min_rank: 0.0,
             authority: crate::plugins::default_authority(),
         };
         let plugin = Plugin {
@@ -3005,7 +3005,7 @@ mod tests {
             build_command: None,
             build_flags: vec![],
             price: 0,
-            min_rank: 0,
+            min_rank: 0.0,
             authority: crate::plugins::default_authority(),
         };
         let plugin = Plugin {

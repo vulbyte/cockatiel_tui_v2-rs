@@ -67,7 +67,7 @@ impl LayoutState {
 
         // Vertical split: top vs chart. Guard the clamps so a tiny terminal
         // (or a resize mid-frame) can never produce max < min and panic.
-        let top_height = (main.height as f64 * self.top_height_pct as f64 / 100.0) as u16;
+        let top_height = (main.height as f32 * self.top_height_pct as f32 / 100.0) as u16;
         let top_max = main.height.saturating_sub(3).max(5);
         let top_height = top_height.clamp(5, top_max).min(main.height);
         let chart_height = main.height.saturating_sub(top_height);
@@ -75,7 +75,7 @@ impl LayoutState {
         let chart_area = Rect { x: main.x, y: main.y + top_height, width: main.width, height: chart_height };
 
         // Horizontal split of top: left vs right
-        let left_width = (main.width as f64 * self.left_width_pct as f64 / 100.0) as u16;
+        let left_width = (main.width as f32 * self.left_width_pct as f32 / 100.0) as u16;
         let left_max = main.width.saturating_sub(10).max(5);
         let left_width = left_width.clamp(5, left_max).min(main.width);
         let right_width = main.width.saturating_sub(left_width);
@@ -84,7 +84,7 @@ impl LayoutState {
         let right_area = Rect { x: main.x + left_width, y: main.y, width: right_width, height: top_height };
 
         // Left column: logo (top) + log (bottom)
-        let log_height = (top_height as f64 * self.log_height_pct as f64 / 100.0) as u16;
+        let log_height = (top_height as f32 * self.log_height_pct as f32 / 100.0) as u16;
         let log_max = top_height.saturating_sub(3).max(3);
         let log_height = log_height.clamp(3, log_max).min(top_height);
         let logo_height = top_height.saturating_sub(log_height);
@@ -97,7 +97,7 @@ impl LayoutState {
 
         // Bottom row: chart (left) + prompts (right of the graph)
         let bottom_row = chart_area;
-        let prompts_width = (chart_area.width as f64 * self.prompts_width_pct as f64 / 100.0) as u16;
+        let prompts_width = (chart_area.width as f32 * self.prompts_width_pct as f32 / 100.0) as u16;
         let prompts_max = chart_area.width.saturating_sub(20).max(10);
         let prompts_width = prompts_width.clamp(10, prompts_max).min(chart_area.width);
         let chart_width = chart_area.width.saturating_sub(prompts_width);
@@ -167,17 +167,17 @@ impl LayoutState {
     pub fn update_from_drag(&mut self, terminal: Rect, edge: DragEdge, x: u16, y: u16) {
         match edge {
             DragEdge::LeftVertical => {
-                let pct = (x as f64 / terminal.width as f64 * 100.0) as u16;
+                let pct = (x as f32 / terminal.width as f32 * 100.0) as u16;
                 self.left_width_pct = pct.clamp(10, 90);
             }
             DragEdge::HorizontalTopBottom => {
-                let pct = (y as f64 / terminal.height as f64 * 100.0) as u16;
+                let pct = (y as f32 / terminal.height as f32 * 100.0) as u16;
                 self.top_height_pct = pct.clamp(10, 90);
             }
             DragEdge::HorizontalLogoLog => {
                 let areas = self.compute(terminal);
                 let local_y = y.saturating_sub(areas.left.y);
-                let pct = (local_y as f64 / areas.left.height as f64 * 100.0) as u16;
+                let pct = (local_y as f32 / areas.left.height as f32 * 100.0) as u16;
                 self.log_height_pct = (100 - pct).clamp(10, 90);
             }
             DragEdge::VerticalChartPrompts => {
@@ -194,7 +194,7 @@ impl LayoutState {
                 let right = row.x + row.width;
                 // Distance from the mouse to the row's right edge = prompts width.
                 let local_x = right.saturating_sub(x).min(row.width);
-                let pct = (local_x as f64 / row.width as f64 * 100.0) as u16;
+                let pct = (local_x as f32 / row.width as f32 * 100.0) as u16;
                 self.prompts_width_pct = pct.clamp(10, 80);
             }
         }

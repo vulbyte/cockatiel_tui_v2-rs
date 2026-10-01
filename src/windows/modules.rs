@@ -254,7 +254,7 @@ fn header_label(group: Group) -> String {
 /// millisecond", which is the resolution the engine reports at); everything
 /// else is one decimal with a unit, e.g. `15.7ms`. `None` (a module that has
 /// not completed a message yet) renders as a blank.
-fn format_ms(avg_ms: Option<f64>) -> String {
+fn format_ms(avg_ms: Option<f32>) -> String {
     match avg_ms {
         None => String::new(),
         Some(v) if v < 1.0 => "<1ms".to_string(),
@@ -266,7 +266,7 @@ fn format_ms(avg_ms: Option<f64>) -> String {
 /// end-to-end latency before the queue starts filling (the inverse of the
 /// per-message latency: `1000/ms` messages/sec, × 60 = `60000/ms`/min). Blank
 /// when there's no latency data yet.
-fn format_throughput(total_ms: f64) -> String {
+fn format_throughput(total_ms: f32) -> String {
     if total_ms <= 0.0 {
         return String::new();
     }
@@ -278,7 +278,7 @@ fn format_throughput(total_ms: f64) -> String {
 /// A simple if/else tree: the higher the latency, the more alarming the
 /// colour. The thresholds are deliberately coarse — they mark the round-trip
 /// cost bands the operator cares about, not a subtle gradient.
-fn ms_color(avg_ms: Option<f64>) -> Color {
+fn ms_color(avg_ms: Option<f32>) -> Color {
     match avg_ms {
         None => Color::DarkGray,
         Some(v) if v < 6.0 => Color::Blue,
@@ -291,7 +291,7 @@ fn ms_color(avg_ms: Option<f64>) -> Color {
 /// The sum of the rolling averages of the modules in `group` — what the group
 /// header reports as its "category average MS" and what the engine row reports
 /// as the total pipeline time. A module with no timing yet contributes 0.
-fn group_total_ms(stats: &GlobalStats, group: Group) -> f64 {
+fn group_total_ms(stats: &GlobalStats, group: Group) -> f32 {
     stats
         .module_entries
         .iter()
@@ -370,21 +370,21 @@ pub fn next_selectable(selected: usize, total: usize, rows: &[GroupedRow], dir: 
         return 0;
     }
     // Walk in the direction, skipping headers...
-    let mut i = selected as i64 + dir as i64;
-    while i >= 0 && i < total as i64 {
+    let mut i = selected as i32 + dir;
+    while i >= 0 && i < total as i32 {
         if !rows[i as usize].is_header() {
             return i as usize;
         }
-        i += dir as i64;
+        i += dir;
     }
     // ...and off the end: the boundary is a header, so fall back to the nearest
     // selectable row in the walked direction (the last module, or the engine).
-    let mut j = if dir > 0 { total as i64 - 1 } else { 0 };
-    while j >= 0 && j < total as i64 {
+    let mut j = if dir > 0 { total as i32 - 1 } else { 0 };
+    while j >= 0 && j < total as i32 {
         if !rows[j as usize].is_header() {
             return j as usize;
         }
-        j -= dir as i64;
+        j -= dir;
     }
     // No selectable row at all — cannot happen while the engine row exists.
     selected
@@ -837,10 +837,10 @@ impl ModulesWindow {
             return serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect());
         }
         let t = text.trim();
-        if let Ok(n) = t.parse::<i64>() {
+        if let Ok(n) = t.parse::<i32>() {
             serde_json::Value::Number(n.into())
-        } else if let Ok(f) = t.parse::<f64>() {
-            serde_json::Number::from_f64(f)
+        } else if let Ok(f) = t.parse::<f32>() {
+            serde_json::Number::from_f64(f as f64)
                 .map(serde_json::Value::Number)
                 .unwrap_or_else(|| serde_json::Value::String(t.to_string()))
         } else if t == "true" {
@@ -1987,7 +1987,7 @@ impl Window for ModulesWindow {
             y += 1;
         }
 
-        let at_limit = stats.db_size_mb > (stats.db_target_mb as f64 * 0.95);
+        let at_limit = stats.db_size_mb > (stats.db_target_mb as f32 * 0.95);
         let db_status = if at_limit {
             "NEAR-LIMIT"
         } else if stats.db_size_mb > 0.0 {
@@ -2044,7 +2044,7 @@ impl Window for ModulesWindow {
             y += 1;
         }
 
-        let mut platforms: Vec<(&String, &u64)> = stats.platform_counts.iter().collect();
+        let mut platforms: Vec<(&String, &u32)> = stats.platform_counts.iter().collect();
         platforms.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
 
         if platforms.is_empty() {
@@ -2663,7 +2663,7 @@ SECRET=s3
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
-        let render = |engine_status: &str, paused: bool, tick: u64| -> String {
+        let render = |engine_status: &str, paused: bool, tick: u32| -> String {
             let mut win = ModulesWindow::new();
             let (w, h) = (120u16, 40u16);
             let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
@@ -2693,7 +2693,7 @@ SECRET=s3
             }
             all
         };
-        let visible_tick = 0u64;
+        let visible_tick = 0u32;
         let dark_tick = crate::app::AppState::PAUSE_FLASH_TICKS;
 
         let paused = render("connected", true, visible_tick);

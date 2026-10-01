@@ -574,7 +574,7 @@ async fn run_app(
     // neither a full repaint nor a ScreenShape change (see `AppState::
     // pause_flash_on`). Held locally so an inbound StatsUpdate (which replaces
     // the whole stats struct) cannot rewind the phase mid-blink.
-    let mut pause_flash_tick: u64 = 0;
+    let mut pause_flash_tick: u32 = 0;
 
     // Autostart: fires ONCE on the first engine connect, launching autostart-tagged
     // modules (the `A` marker) and resuming the paused pipeline. A reconnect
@@ -3764,7 +3764,7 @@ mod tests {
                     build_command: None,
                     build_flags: Vec::new(),
                     price: 0,
-                    min_rank: 0,
+                    min_rank: 0.0,
                     authority: crate::plugins::default_authority(),
                 },
                 directory: dir,
@@ -3982,7 +3982,7 @@ mod pause_blink_wiring_tests {
         );
         // ...while the phase still reaches the renderer through stats.
         let db = include_str!("db.rs");
-        assert!(db.contains("pub pause_flash_tick: u64"), "the tick must be part of stats");
+        assert!(db.contains("pub pause_flash_tick: u32"), "the tick must be part of stats");
     }
 
     #[test]

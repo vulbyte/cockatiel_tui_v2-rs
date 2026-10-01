@@ -24,12 +24,12 @@ pub struct ModuleStatus {
     pub alive: bool,
     /// Rolling average processing time (ms) for the module's last 8 messages,
     /// reported by the engine. `None` until it has completed a message.
-    pub avg_ms: Option<f64>,
+    pub avg_ms: Option<f32>,
     /// Whether the module is set to start automatically (from its manifest).
     pub autostart: bool,
     /// The module's authority gate level (0=user, 1=mod, 2=admin, 3=owner),
     /// from its manifest.
-    pub authority: u64,
+    pub authority: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -47,16 +47,16 @@ pub struct UserSummary {
     pub is_moderator: bool,
     pub is_admin: bool,
     pub is_owner: bool,
-    pub score: i64,
-    pub commendations: i64,
-    pub reprimands: i64,
+    pub score: i32,
+    pub commendations: i32,
+    pub reprimands: i32,
     /// Channels as "platform:channel_id (handle)" display strings.
     pub channels: Vec<String>,
     pub flags: String,
     /// Lifetime score earned (never reduced by spending).
-    pub total_score: i64,
+    pub total_score: i32,
     /// Chat messages this user has sent.
-    pub messages_sent: i64,
+    pub messages_sent: i32,
     /// The user's numeric rank on the 0-1 scale (computed server-side by the
     /// user db). Numbers are for logic; tier NAMES come from the root
     /// `rank_chart.json`.
@@ -79,13 +79,13 @@ pub struct UserValue {
 
 #[derive(Debug, Clone)]
 pub struct GlobalStats {
-    pub total_messages: u64,
-    pub total_users: u64,
-    pub total_commands: u64,
-    pub platform_counts: HashMap<String, u64>,
-    pub platform_errors: HashMap<String, u64>,
+    pub total_messages: u32,
+    pub total_users: u32,
+    pub total_commands: u32,
+    pub platform_counts: HashMap<String, u32>,
+    pub platform_errors: HashMap<String, u32>,
     pub chart_data: Vec<TimeBucket>,
-    pub db_size_mb: f64,
+    pub db_size_mb: f32,
     pub db_target_mb: u64,
     pub engine_status: String,
     /// The operator removed the engine from this TUI (`Action::RemoveEngine`).
@@ -121,7 +121,7 @@ pub struct GlobalStats {
     /// [`crate::app::pause_flash_on`]). Advanced by the draw loop, not by the
     /// engine: it lives in stats because that is the only per-frame channel
     /// every window's `render` already receives.
-    pub pause_flash_tick: u64,
+    pub pause_flash_tick: u32,
     /// The user database, polled via `userdb_list_users` and rendered by the
     /// detached users window. Sorted by the engine (score DESC).
     pub users: Vec<UserSummary>,
@@ -144,7 +144,7 @@ pub struct GlobalStats {
 #[derive(Debug, Clone)]
 pub struct TimeBucket {
     pub timestamp: u64,
-    pub counts: HashMap<String, u64>,
+    pub counts: HashMap<String, u32>,
 }
 
 impl Default for GlobalStats {
@@ -338,15 +338,15 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
     // `stats` op: all timeline aggregates in one response.
     if query_id == "stats" && result.success {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&result.result_blob) {
-            stats.total_messages = v.get("total_messages").and_then(|x| x.as_u64()).unwrap_or(0);
-            stats.total_users = v.get("total_users").and_then(|x| x.as_u64()).unwrap_or(0);
-            stats.total_commands = v.get("total_commands").and_then(|x| x.as_u64()).unwrap_or(0);
+            stats.total_messages = v.get("total_messages").and_then(|x| x.as_u64()).map(|x| x as u32).unwrap_or(0);
+            stats.total_users = v.get("total_users").and_then(|x| x.as_u64()).map(|x| x as u32).unwrap_or(0);
+            stats.total_commands = v.get("total_commands").and_then(|x| x.as_u64()).map(|x| x as u32).unwrap_or(0);
             stats.platform_counts.clear();
             if let Some(arr) = v.get("platform_counts").and_then(|x| x.as_array()) {
                 for row in arr {
                     if let (Some(platform), Some(count)) = (
                         row.get("platform").and_then(|x| x.as_str()),
-                        row.get("n").and_then(|x| x.as_u64()),
+                        row.get("n").and_then(|x| x.as_u64()).map(|x| x as u32),
                     ) {
                         stats.platform_counts.insert(platform.to_string(), count);
                     }
@@ -357,7 +357,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                 for row in arr {
                     if let (Some(platform), Some(count)) = (
                         row.get("platform").and_then(|x| x.as_str()),
-                        row.get("n").and_then(|x| x.as_u64()),
+                        row.get("n").and_then(|x| x.as_u64()).map(|x| x as u32),
                     ) {
                         stats.platform_errors.insert(platform.to_string(), count);
                     }
@@ -370,7 +370,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                     if let (Some(bucket_ts), Some(platform), Some(count)) = (
                         row.get("bucket").and_then(|x| x.as_i64()),
                         row.get("platform").and_then(|x| x.as_str()),
-                        row.get("n").and_then(|x| x.as_u64()),
+                        row.get("n").and_then(|x| x.as_u64()).map(|x| x as u32),
                     ) {
                         let entry = buckets.entry(bucket_ts).or_insert_with(|| TimeBucket {
                             timestamp: bucket_ts as u64,
@@ -422,9 +422,9 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                             .unwrap_or_default();
                         let config_complete = row.get("config_complete").and_then(|v| v.as_bool()).unwrap_or(false);
                         let alive = row.get("alive").and_then(|v| v.as_bool()).unwrap_or(true);
-                        let avg_ms = row.get("avg_ms").and_then(|v| v.as_f64());
+                        let avg_ms = row.get("avg_ms").and_then(|v| v.as_f64()).map(|f| f as f32);
                         let autostart = row.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let authority = row.get("authority").and_then(|v| v.as_u64()).unwrap_or(1);
+                        let authority = row.get("authority").and_then(|v| v.as_u64()).map(|x| x as u32).unwrap_or(1);
 
                         stats.module_entries.push(ModuleStatus {
                             name: name.to_string(),
@@ -474,10 +474,10 @@ pub fn pipeline_pause_note(result: &DatabaseQueryResult) -> Option<String> {
     let paused = v.get("paused").and_then(|b| b.as_bool()).unwrap_or(false);
     if v.get("changed").and_then(|b| b.as_bool()).unwrap_or(false) {
         if paused {
-            let held = v.get("held_messages").and_then(|n| n.as_u64()).unwrap_or(0);
+            let held = v.get("held_messages").and_then(|n| n.as_u64()).map(|x| x as u32).unwrap_or(0);
             Some(format!("pipeline PAUSED — holding {} queued message(s)", held))
         } else {
-            let released = v.get("resumed_messages").and_then(|n| n.as_u64()).unwrap_or(0);
+            let released = v.get("resumed_messages").and_then(|n| n.as_u64()).map(|x| x as u32).unwrap_or(0);
             Some(format!(
                 "pipeline RESUMED — releasing {} held message(s) in the background",
                 released
@@ -517,13 +517,13 @@ fn parse_user(v: &serde_json::Value) -> Option<UserSummary> {
         is_moderator: v.get("is_moderator").and_then(|x| x.as_bool()).unwrap_or(false),
         is_admin: v.get("is_admin").and_then(|x| x.as_bool()).unwrap_or(false),
         is_owner: v.get("is_owner").and_then(|x| x.as_bool()).unwrap_or(false),
-        score: v.get("score").and_then(|x| x.as_i64()).unwrap_or(0),
-        commendations: v.get("commendations").and_then(|x| x.as_i64()).unwrap_or(0),
-        reprimands: v.get("reprimands").and_then(|x| x.as_i64()).unwrap_or(0),
+        score: v.get("score").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
+        commendations: v.get("commendations").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
+        reprimands: v.get("reprimands").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
         channels,
         flags: v.get("flags").and_then(|x| x.as_str()).unwrap_or("{}").to_string(),
-        total_score: v.get("total_score").and_then(|x| x.as_i64()).unwrap_or(0),
-        messages_sent: v.get("messages_sent").and_then(|x| x.as_i64()).unwrap_or(0),
+        total_score: v.get("total_score").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
+        messages_sent: v.get("messages_sent").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
         rank: v.get("rank").and_then(|x| x.as_f64()).map(|f| f as f32).unwrap_or(0.0),
     })
 }
@@ -832,8 +832,8 @@ mod tests {
             total_messages: 42,
             total_users: 7,
             total_commands: 9,
-            platform_counts: [("twitch".to_string(), 5u64)].into_iter().collect(),
-            platform_errors: [("twitch".to_string(), 2u64)].into_iter().collect(),
+            platform_counts: [("twitch".to_string(), 5u32)].into_iter().collect(),
+            platform_errors: [("twitch".to_string(), 2u32)].into_iter().collect(),
             db_size_mb: 12.5,
             db_target_mb: 99,
             engine_status: "connected".to_string(),
