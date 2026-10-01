@@ -1870,6 +1870,9 @@ fn is_dispatchable(action: &Action) -> bool {
             | Action::RemoveEngine
             | Action::RestartEngine
             | Action::MoveModuleStage(_, _)
+            | Action::SplitVertical
+            | Action::SplitHorizontal
+            | Action::JoinPanes
     )
 }
 

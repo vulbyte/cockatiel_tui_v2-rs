@@ -505,10 +505,16 @@ impl AppState {
                 }
                 Action::Quit => return Some(Action::Quit),
                 // A global action that the engine/supervisor performs (e.g. the
-                // pipeline pause toggle). Handed back to the caller, which runs
-                // it through the same dispatch path as a window action — a
-                // global binding must work from ANY focused window.
+                // pipeline pause toggle, pane split/join). Handed back to the
+                // caller, which runs it through the same dispatch path as a
+                // window action — a global binding must work from ANY focused
+                // window.
                 Action::TogglePipelinePause => return Some(Action::TogglePipelinePause),
+                // Pane management: split/join work from any focused pane, so
+                // they are forwarded for dispatch like the pause toggle.
+                Action::SplitVertical => return Some(Action::SplitVertical),
+                Action::SplitHorizontal => return Some(Action::SplitHorizontal),
+                Action::JoinPanes => return Some(Action::JoinPanes),
                 _ => {}
             }
         }
@@ -823,6 +829,19 @@ mod tests {
         assert!(hit_body.is_some());
         let (_, is_header) = hit_body.unwrap();
         assert!(!is_header, "a row below the header is not the header");
+    }
+
+    #[test]
+    fn split_and_join_global_keys_dispatch() {
+        // The pane-management hotkeys must be returned for dispatch from any
+        // focused pane (they were silently swallowed by the `_ => {}` arm).
+        let mut s = state();
+        let split_v = KeyEvent::new(crossterm::event::KeyCode::Char('v'), crossterm::event::KeyModifiers::CONTROL);
+        let split_h = KeyEvent::new(crossterm::event::KeyCode::Char('h'), crossterm::event::KeyModifiers::CONTROL);
+        let join = KeyEvent::new(crossterm::event::KeyCode::Char('w'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(s.handle_global_key(split_v), Some(Action::SplitVertical));
+        assert_eq!(s.handle_global_key(split_h), Some(Action::SplitHorizontal));
+        assert_eq!(s.handle_global_key(join), Some(Action::JoinPanes));
     }
 
     #[test]
