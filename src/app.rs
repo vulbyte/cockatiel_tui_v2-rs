@@ -236,6 +236,8 @@ pub struct AppState {
     pub tree: crate::bsp::LayoutTree,
     /// Open view-type dropdown state (the `[v] view_type` header menu).
     pub dropdown: DropdownState,
+    /// Where the BSP layout is persisted (layout.json), saved on quit.
+    pub layout_path: Option<std::path::PathBuf>,
     /// The configured terminal emulator (from the TUI's config.json
     /// `terminal_emulator` key). Empty/None = the system default. Used to open
     /// terminal modules and pop-out windows.
@@ -371,6 +373,7 @@ impl AppState {
             active_window: tree.focused_view().window_id(),
             tree,
             dropdown: DropdownState::default(),
+            layout_path: None,
             terminal_emulator: None,
             force_full_redraw: false,
             stats: GlobalStats::default(),

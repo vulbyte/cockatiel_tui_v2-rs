@@ -75,6 +75,12 @@ pub enum Action {
     /// direction and the dispatcher — which owns the supervisor — resolves what
     /// the move actually is (a stage jump, or an in-process reorder).
     MoveModuleStage(String, StageDirection),
+    /// Split the focused pane vertically (top/bottom).
+    SplitVertical,
+    /// Split the focused pane horizontally (left/right).
+    SplitHorizontal,
+    /// Join the focused pane into its sibling.
+    JoinPanes,
     Noop,
 }
 
@@ -191,6 +197,9 @@ fn parse_action(s: &str) -> Action {
         "TogglePipelinePause" => Action::TogglePipelinePause,
         "RemoveEngine" => Action::RemoveEngine,
         "RestartEngine" => Action::RestartEngine,
+        "SplitVertical" => Action::SplitVertical,
+        "SplitHorizontal" => Action::SplitHorizontal,
+        "JoinPanes" => Action::JoinPanes,
         _ => Action::Noop,
     }
 }
@@ -271,6 +280,9 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::RemoveEngine => "detach",
         Action::RestartEngine => "restart",
         Action::MoveModuleStage(_, _) => "stage",
+        Action::SplitVertical => "split-v",
+        Action::SplitHorizontal => "split-h",
+        Action::JoinPanes => "join",
         Action::Quit => "quit",
         Action::FocusNext => "window-next",
         Action::FocusPrev => "window-prev",
@@ -487,6 +499,12 @@ pub fn default_hotkeys() -> HotkeyConfig {
     global.insert(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()), Action::FocusNext);
     global.insert(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), Action::FocusPrev);
     global.insert(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()), Action::Quit);
+    // Pane management (the BSP layout): Ctrl+v splits the focused pane
+    // vertically, Ctrl+h horizontally, Ctrl+w joins it into its sibling. These
+    // read as "vim split" mnemonics and collide with no existing binding.
+    global.insert(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), Action::SplitVertical);
+    global.insert(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL), Action::SplitHorizontal);
+    global.insert(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), Action::JoinPanes);
     // `p` → pause/resume the engine's dispatch gate. Global, because the gate
     // is engine-wide: an operator must be able to resume from any window, not
     // just the modules one. `p` was chosen for the mnemonic and because it is

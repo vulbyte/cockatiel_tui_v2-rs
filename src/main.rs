@@ -439,8 +439,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.tree = crate::bsp::single_tree(view);
         state.sync_active_window();
     } else {
-        // Embedded mode: the default 5-pane BSP tree.
-        state.tree = crate::bsp::default_tree();
+        // Embedded mode: restore the persisted BSP layout if present, else the
+        // default 5-pane tree. Save on exit.
+        let layout_path = config_dir.join("layout.json");
+        state.layout_path = Some(layout_path.clone());
+        state.tree = crate::bsp::LayoutTree::load(&layout_path)
+            .unwrap_or_else(crate::bsp::default_tree);
         state.sync_active_window();
     }
 
@@ -1208,6 +1212,7 @@ async fn handle_input_event(
                             state.tree.swap_view_by_id(&leaf_id, choice);
                             state.sync_active_window();
                             state.force_full_redraw = true;
+                            persist_layout(state);
                         }
                         return Ok(false);
                     }
@@ -2575,6 +2580,16 @@ fn spawn_monitor(
 
 /// Dispatch a supervisor/engine action. Returns true when the app should quit.
 #[allow(clippy::too_many_arguments)]
+/// Persist the current BSP layout to disk (best-effort; a write failure is
+/// logged and ignored — losing the layout is never worth crashing the TUI).
+fn persist_layout(state: &AppState) {
+    if let Some(path) = &state.layout_path {
+        if let Err(e) = state.tree.save(path) {
+            crate::app::supervisor_log_global(format!("[layout] failed to persist {}: {}", path.display(), e));
+        }
+    }
+}
+
 async fn dispatch_action(
     state: &mut AppState,
     action: Action,
@@ -2587,7 +2602,34 @@ async fn dispatch_action(
     ws_auth_token: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match action {
-        Action::Quit => return Ok(true),
+        Action::Quit => {
+            persist_layout(state);
+            return Ok(true);
+        }
+        Action::SplitVertical => {
+            if state.tree.split_focused(crate::bsp::Axis::Vertical) {
+                state.sync_active_window();
+                state.force_full_redraw = true;
+                persist_layout(state);
+            }
+            return Ok(false);
+        }
+        Action::SplitHorizontal => {
+            if state.tree.split_focused(crate::bsp::Axis::Horizontal) {
+                state.sync_active_window();
+                state.force_full_redraw = true;
+                persist_layout(state);
+            }
+            return Ok(false);
+        }
+        Action::JoinPanes => {
+            if state.tree.join_focused() {
+                state.sync_active_window();
+                state.force_full_redraw = true;
+                persist_layout(state);
+            }
+            return Ok(false);
+        }
         Action::PopOut(window_name) => {
             state.popped_out.insert(window_name.clone());
             let exe = std::env::current_exe().unwrap_or_default();
