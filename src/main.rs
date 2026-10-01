@@ -2674,6 +2674,22 @@ async fn dispatch_action(
             }
             return Ok(false);
         }
+        Action::OpenUsers => {
+            // Open the users panel as a sub-window: focus an existing
+            // `top_users` pane if one is mounted. Never auto-splits and never
+            // pops out — the user creates a users pane themselves via split +
+            // the view dropdown (Ctrl+T), all their own choice.
+            if state.tree.focus_view(crate::bsp::ViewType::TopUsers) {
+                state.sync_active_window();
+                state.announce_focus();
+                state.force_full_redraw = true;
+            } else {
+                crate::app::supervisor_log_global(
+                    "users: no top_users pane mounted — split a pane and pick top_users from the view dropdown (Ctrl+T)".to_string(),
+                );
+            }
+            return Ok(false);
+        }
         Action::PopOut(window_name) => {
             state.popped_out.insert(window_name.clone());
             let exe = std::env::current_exe().unwrap_or_default();

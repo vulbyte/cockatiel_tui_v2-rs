@@ -81,6 +81,11 @@ pub enum Action {
     SplitHorizontal,
     /// Join the focused pane into its sibling.
     JoinPanes,
+    /// Open the users panel as a sub-window: focus an existing `top_users`
+    /// pane if one is mounted, otherwise do nothing (the user creates a pane
+    /// themselves via split + the view dropdown). Never auto-splits and never
+    /// pops out a separate window.
+    OpenUsers,
     Noop,
 }
 
@@ -208,6 +213,7 @@ fn parse_action(s: &str) -> Action {
         "SplitVertical" => Action::SplitVertical,
         "SplitHorizontal" => Action::SplitHorizontal,
         "JoinPanes" => Action::JoinPanes,
+        "OpenUsers" => Action::OpenUsers,
         _ => Action::Noop,
     }
 }
@@ -308,6 +314,7 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::SplitVertical => "split-v",
         Action::SplitHorizontal => "split-h",
         Action::JoinPanes => "join",
+        Action::OpenUsers => "users",
         Action::Quit => "quit",
         Action::FocusNext => "window-next",
         Action::FocusPrev => "window-prev",
@@ -573,7 +580,7 @@ pub fn default_hotkeys() -> HotkeyConfig {
     module_actions.insert(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), Action::RestartEngine);
     module_actions.insert(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT), Action::RemoveEngine);
     module_actions.insert(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()), Action::RunTests);
-    module_actions.insert(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()), Action::PopOut("users".to_string()));
+    module_actions.insert(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()), Action::OpenUsers);
 
     let mut chart_actions = HashMap::new();
     chart_actions.insert(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()), Action::TimeWindow5m);
@@ -650,10 +657,11 @@ mod tests {
             .values()
             .any(|a| matches!(a, Action::EditConfig(_))));
         // A default binding NOT in the file still survives the merge:
-        // `u` → PopOut("users") is a default that the file omits.
+        // `u` → OpenUsers (the users panel as a sub-window) is a default that
+        // the file omits.
         assert!(modules
             .values()
-            .any(|a| matches!(a, Action::PopOut(ref w) if w == "users")));
+            .any(|a| matches!(a, Action::OpenUsers)));
         // `c` duplicates the selected module; `b` clears its config.
         assert!(modules
             .values()
@@ -675,16 +683,18 @@ mod tests {
     }
 
     #[test]
-    fn u_binds_users_popout_in_modules_window() {
+    fn u_binds_open_users_in_modules_window() {
         let cfg = load_hotkeys(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hotkey_config.json"),
         );
         let modules = cfg.window_actions.get("modules").expect("modules map");
         let u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty());
-        // The `u` default survives the config-file merge.
-        assert_eq!(modules.get(&u), Some(&Action::PopOut("users".to_string())));
-        // And it renders the dedicated `users` label in the hotkey bar.
-        assert_eq!(action_label(&Action::PopOut("users".to_string())), "users");
+        // The `u` default survives the config-file merge. It now opens the
+        // users panel as a SUB-WINDOW (focus an existing top_users pane), not
+        // a detached pop-out.
+        assert_eq!(modules.get(&u), Some(&Action::OpenUsers));
+        // And it renders the `users` label in the hotkey bar.
+        assert_eq!(action_label(&Action::OpenUsers), "users");
         assert_eq!(action_label(&Action::PopOut("log".to_string())), "popout");
         let bar = cfg.format_window("modules", &["start", "stop", "del", "auto", "creds", "edit", "test", "select"]);
         assert!(bar.contains("users:[u]"), "bar: {}", bar);

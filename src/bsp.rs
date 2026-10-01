@@ -620,6 +620,20 @@ impl LayoutTree {
         self.focus = self.path_to_id(id);
     }
 
+    /// Focus the first leaf hosting `view`. Returns true if such a leaf
+    /// existed (focus moved); false if the view is not mounted anywhere.
+    pub fn focus_view(&mut self, view: ViewType) -> bool {
+        let order = self.leaf_order();
+        let id = order.into_iter().find(|(_, v)| *v == view).map(|(id, _)| id);
+        match id {
+            Some(id) => {
+                self.focus = self.path_to_id(&id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether a click at `(x, y)` is on ANY divider in the tree, and which side
     /// of it. Returns `(path, dir)` where `path` is the split to resize.
     /// This makes every sub-window border draggable, not just the focused one.
@@ -1095,5 +1109,19 @@ mod tests {
         let a: Vec<&str> = t.leaf_order().iter().map(|(_, v)| v.name()).collect();
         let b: Vec<&str> = rebuilt.leaf_order().iter().map(|(_, v)| v.name()).collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn focus_view_finds_a_mounted_view_and_never_splits() {
+        let mut t = tree_3();
+        // Default tree has no top_users pane.
+        assert!(!t.focus_view(crate::bsp::ViewType::TopUsers));
+        // Mount one by swapping the logs leaf, then it is focusable.
+        t.swap_view_by_id("logs", crate::bsp::ViewType::TopUsers);
+        let leaves_before = t.leaf_order().len();
+        assert!(t.focus_view(crate::bsp::ViewType::TopUsers));
+        assert_eq!(t.focused_view(), crate::bsp::ViewType::TopUsers);
+        // Focusing a view must never add panes (no auto-split).
+        assert_eq!(t.leaf_order().len(), leaves_before);
     }
 }
