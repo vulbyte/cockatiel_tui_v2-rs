@@ -238,6 +238,12 @@ pub struct AppState {
     pub dropdown: DropdownState,
     /// Where the BSP layout is persisted (layout.json), saved on quit.
     pub layout_path: Option<std::path::PathBuf>,
+    /// Accessibility: whether the F1 help/tooltip modal is open.
+    pub help_open: bool,
+    /// Accessibility: whether spatial TTS announcements are enabled.
+    pub tts_enabled: bool,
+    /// The active TTS backend (muted when disabled).
+    pub tts: Box<dyn crate::tts::TtsBackend>,
     /// The configured terminal emulator (from the TUI's config.json
     /// `terminal_emulator` key). Empty/None = the system default. Used to open
     /// terminal modules and pop-out windows.
@@ -374,6 +380,9 @@ impl AppState {
             tree,
             dropdown: DropdownState::default(),
             layout_path: None,
+            help_open: false,
+            tts_enabled: false,
+            tts: Box::new(crate::tts::MutedBackend),
             terminal_emulator: None,
             force_full_redraw: false,
             stats: GlobalStats::default(),
@@ -485,11 +494,13 @@ impl AppState {
                 Action::FocusLeft | Action::FocusUp | Action::FocusPrev => {
                     self.tree.focus_prev();
                     self.sync_active_window();
+                    self.announce_focus();
                     return Some(Action::Noop);
                 }
                 Action::FocusRight | Action::FocusDown | Action::FocusNext => {
                     self.tree.focus_next();
                     self.sync_active_window();
+                    self.announce_focus();
                     return Some(Action::Noop);
                 }
                 Action::Quit => return Some(Action::Quit),
@@ -513,6 +524,56 @@ impl AppState {
     /// the focused view.
     pub fn sync_active_window(&mut self) {
         self.active_window = self.tree.focused_view().window_id();
+    }
+
+    /// Enable/disable spatial TTS announcements. Returns the new state.
+    pub fn toggle_tts(&mut self) -> bool {
+        self.tts_enabled = !self.tts_enabled;
+        if self.tts_enabled {
+            self.tts = crate::tts::default_backend();
+            self.tts.speak("Accessibility mode enabled.");
+        } else {
+            self.tts = Box::new(crate::tts::MutedBackend);
+        }
+        self.tts_enabled
+    }
+
+    /// Announce the focused pane's structural context ("Subwindow focused.
+    /// Position: Top Left. Current tool: Logs. Press F1 for actions."). Called
+    /// on every focus move when TTS is enabled.
+    pub fn announce_focus(&mut self) {
+        if !self.tts_enabled {
+            return;
+        }
+        let view = self.tree.focused_view();
+        let (row, col) = match self.tree.focused_rect() {
+            Some(rect) => {
+                // A cheap positional label: left/right + top/bottom by the
+                // leaf's center relative to the screen. The rect is in terminal
+                // cells; the screen size is captured at compute time.
+                let left = rect.x < 40;
+                let top = rect.y < 12;
+                (if top { "Top" } else { "Bottom" }, if left { "Left" } else { "Right" })
+            }
+            None => ("", ""),
+        };
+        let text = format!(
+            "Subwindow focused. Position: {} {}. Current tool: {}. Press F1 for actions.",
+            row, col, view.name()
+        );
+        self.tts.speak(&text);
+    }
+
+    /// Open the F1 accessibility help modal and announce it.
+    pub fn open_help(&mut self) {
+        self.help_open = true;
+        self.tts.speak("Accessibility help. Press Escape to close.");
+    }
+
+    /// Close the F1 help modal, speaking a return-to-context confirmation.
+    pub fn close_help(&mut self) {
+        self.help_open = false;
+        self.tts.speak("Context closed, returning to editor.");
     }
 
     /// The leaf whose rectangle contains `(x, y)`, if any. Leaves are checked
@@ -611,7 +672,37 @@ impl AppState {
         // Draw the open dropdown as an overlay, last so it sits on top.
         if !single {
             self.render_dropdown(frame, size);
+            if self.help_open {
+                self.render_help_modal(frame, size);
+            }
         }
+    }
+
+    /// Render the F1 accessibility help modal (a bordered box describing the
+    /// focused view + available controls). ESC closes it.
+    fn render_help_modal(&self, frame: &mut ratatui::Frame, size: ratatui::layout::Rect) {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+        let view = self.tree.focused_view();
+        let depth = self.tree.focus.len();
+        let text = vec![
+            Line::from(Span::styled("ACCESSIBILITY HELP & ACTIONS (Press ESC to close)", Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled(format!("You are currently interacting with: [{}].", view.name()), Style::default())),
+            Line::from(Span::styled(format!("Layout tree depth: {} pane(s) active.", depth.max(1)), Style::default())),
+            Line::from(Span::styled("Available controls:", Style::default())),
+            Line::from(Span::styled("  split-v: split this view vertically", Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled("  split-h: split this view horizontally", Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled("  join:    close this pane into its sibling", Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled("  Ctrl+T:  change this pane's view", Style::default().fg(Color::Cyan))),
+        ];
+        let w = text.iter().map(|l| l.width()).max().unwrap_or(30) as u16 + 4;
+        let h = text.len() as u16 + 2;
+        let x = size.x + size.width.saturating_sub(w) / 2;
+        let y = size.y + size.height.saturating_sub(h) / 2;
+        let area = ratatui::layout::Rect { x, y, width: w.min(size.width), height: h };
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow));
+        Paragraph::new(text).block(block).render(area, frame.buffer_mut());
     }
 
     /// Render a leaf's `[v] view_type` header strip.

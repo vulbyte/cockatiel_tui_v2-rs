@@ -7,6 +7,7 @@ mod hotkeys;
 mod layout;
 mod plugins;
 mod supervisor;
+mod tts;
 mod windows;
 mod ws_client;
 mod ws_server;
@@ -1197,6 +1198,29 @@ async fn handle_input_event(
                 }
             }
 
+            // The F1 accessibility help modal: ESC is the safe route out.
+            if state.help_open {
+                if key.code == KeyCode::Esc {
+                    state.close_help();
+                }
+                return Ok(false);
+            }
+
+            // F1 opens the accessibility help modal; Ctrl+u toggles TTS.
+            if key.code == KeyCode::F(1) {
+                state.open_help();
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+                let enabled = state.toggle_tts();
+                supervisor_log(state, if enabled {
+                    "[accessibility] TTS announcements enabled (F1 for help)".to_string()
+                } else {
+                    "[accessibility] TTS announcements disabled".to_string()
+                });
+                return Ok(false);
+            }
+
             // The view-type dropdown (per-pane `[v]` menu) owns the keyboard
             // while it is open: arrows move, confirm swaps the view, deny/esc
             // closes without changing anything.
@@ -1442,6 +1466,7 @@ async fn handle_input_event(
                         // Focus this leaf.
                         state.tree.set_focus_to(&leaf_id);
                         state.sync_active_window();
+                        state.announce_focus();
                         // Clicking the `[v]` header opens that pane's dropdown.
                         if is_header {
                             if let Some(view) = state.tree.view_at(&leaf_id) {
