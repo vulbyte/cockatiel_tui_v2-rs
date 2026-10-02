@@ -1160,6 +1160,33 @@ fn macos_launch_args(emu: &str) -> Vec<String> {
     }
 }
 
+/// Give a just-spawned child a short window to prove it is alive. `try_wait`
+/// returns immediately, so this polls briefly to catch a launch that dies in
+/// the first moments (an emulator that rejects the arg convention exits fast).
+/// Returns true while the process is still running.
+fn wait_for_process_alive(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            // Still running.
+            Ok(None) => {
+                // Survived a poll; if the launch window is still open keep
+                // watching (a fast crash shows up within the window), otherwise
+                // it's good enough to call it alive.
+                if std::time::Instant::now() >= deadline {
+                    return true;
+                }
+            }
+            // Reaped or errored: it's gone.
+            Ok(Some(_)) | Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Launch a command in a macOS terminal emulator by running its binary
 /// directly with `-e sh -c "<run>"` (or the emulator's own convention). Used
 /// for emulators that have no AppleScript `do script` support (anything other
@@ -1176,9 +1203,40 @@ fn macos_launch_binary(binary: &std::path::Path, emu_name: &str, run: &str) -> R
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // If the emulator exits within 3s it did not actually open a usable
+            // window (e.g. it rejected the arg convention). Fall back to the
+            // system default terminal (Terminal.app) so the command still runs.
+            if !wait_for_process_alive(&mut child, std::time::Duration::from_secs(3)) {
+                return fallback_to_terminal_app(run);
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("failed to launch {}: {}", binary.display(), e)),
+    }
+}
+
+/// Run `run` in the macOS system default terminal (Terminal.app) via
+/// AppleScript. Used as the fallback when a configured emulator fails to open.
+fn fallback_to_terminal_app(run: &str) -> Result<(), String> {
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        apple_quote(run)
+    );
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e")
+        .arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.spawn()
         .map(|_| ())
-        .map_err(|e| format!("failed to launch {}: {}", binary.display(), e))
+        .map_err(|e| format!("failed to open the system terminal: {}", e))
 }
 
 /// Fuzzy match a query against a candidate: `query` must appear as a
@@ -1700,9 +1758,18 @@ pub fn spawn_terminal_from_parts(
                         use std::os::unix::process::CommandExt;
                         cmd.process_group(0);
                     }
-                    return cmd.spawn()
-                        .map(|child| (child, None, None))
-                        .map_err(|e| format!("Failed to launch '{}' in {}: {}", p.manifest.name, configured, e));
+                    // Give the emulator ~3s to prove it is alive. Some emulators
+                    // exit immediately when handed args they don't understand
+                    // (e.g. a binary that rejects `-e`), which would leave the
+                    // module spinning in "waiting to connect" forever. If the
+                    // process dies within the window, fall back to the system
+                    // default terminal (Terminal.app via AppleScript below).
+                    if let Ok(mut child) = cmd.spawn() {
+                        if wait_for_process_alive(&mut child, std::time::Duration::from_secs(3)) {
+                            return Ok((child, None, None));
+                        }
+                    }
+                    let _ = cmd;
                 }
             }
             // Terminal.app (or an unresolved emulator): use AppleScript, which
@@ -3874,5 +3941,27 @@ mod tests {
         assert_eq!(pos("zebra"), "postprocess");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wait_for_process_alive_detects_immediate_exit() {
+        // A process that exits instantly must be reported as NOT alive.
+        let mut dead = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        assert!(
+            !wait_for_process_alive(&mut dead, std::time::Duration::from_secs(3)),
+            "a process that exits immediately is a failed launch"
+        );
+
+        // A long-running process is alive.
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(wait_for_process_alive(&mut live, std::time::Duration::from_secs(1)));
+        let _ = live.kill();
+        let _ = live.wait();
     }
 }
