@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let override_port = cli.override_port;
     let override_pin = cli.override_pin;
 
-    let config_dir = std::env::current_dir().unwrap_or_default();
+    let config_dir = crate::supervisor::tui_dir();
     // The TUI's own config, next to hotkey_config.json / color_config.json. The
     // writer runs first so a fresh install (an empty directory, or one whose
     // config.json predates a key) gets the default rather than silently
@@ -332,13 +332,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Discover plugins recursively from the current directory and the repo's
-        // `modules/` folder (sibling to this crate, where the modules live).
+        // `modules/` folder (sibling to this crate, where the modules live). The
+        // modules dir is resolved relative to the TUI crate (not the launch cwd)
+        // so running the TUI from anywhere still finds the repo's modules.
         let cwd = std::env::current_dir().unwrap_or_default();
         let mut discovered = crate::plugins::discover_plugins(&cwd);
         if let Some(parent) = cwd.parent() {
             let modules_dir = parent.join("modules");
             if modules_dir.exists() {
                 for p in crate::plugins::discover_plugins(&modules_dir) {
+                    if !discovered.iter().any(|x| x.manifest.name == p.manifest.name) {
+                        discovered.push(p);
+                    }
+                }
+            }
+        }
+        if let Some(repo_modules) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("modules"))
+        {
+            if repo_modules.exists() {
+                for p in crate::plugins::discover_plugins(&repo_modules) {
                     if !discovered.iter().any(|x| x.manifest.name == p.manifest.name) {
                         discovered.push(p);
                     }

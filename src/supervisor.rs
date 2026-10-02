@@ -691,6 +691,17 @@ pub fn user_db_dir() -> PathBuf {
         .join("cockatiel_user_database-rs")
 }
 
+/// The TUI's own directory. Config files (`config.json`, `hotkey_config.json`,
+/// `color_config.json`, `layout.json`) always live HERE, regardless of the
+/// launch working directory — so running the TUI from anywhere (repo root,
+/// another cwd) reads the same config. The engine launches with its own CWD and
+/// looks for `../config.json`, so if the TUI resolved its config from
+/// `current_dir()` a launch from the repo root would make the engine mistake
+/// the TUI's config for its own and crash on parse.
+pub fn tui_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+}
+
 /// The shared rank chart at the repo root. Injected as `COCKATIEL_RANK_CHART`
 /// into engine + module processes so every consumer reads the same tier names.
 pub fn rank_chart_path() -> PathBuf {
