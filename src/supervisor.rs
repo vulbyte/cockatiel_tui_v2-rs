@@ -1156,8 +1156,26 @@ fn terminal_candidates_for(emu: &str) -> Vec<(&str, &[&str])> {
 fn macos_launch_args(emu: &str) -> Vec<String> {
     match emu.to_ascii_lowercase() {
         e if e.contains("wezterm") => vec!["start".into(), "--".into(), "sh".into(), "-c".into()],
+        // kitty takes the command directly (no `-e`); `--hold` keeps the window
+        // open so the module owns the terminal instead of flashing closed.
+        e if e.contains("kitty") => vec!["--hold".into(), "sh".into(), "-c".into()],
         _ => vec!["-e".into(), "sh".into(), "-c".into()],
     }
+}
+
+/// Wait up to `timeout` for `path` to exist. The module's launcher writes its
+/// pidfile as the FIRST thing the inner command does, so its appearance proves
+/// the terminal actually ran the command — not just that the emulator GUI is
+/// alive. Returns true once the file exists.
+fn wait_for_pidfile(path: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    path.exists()
 }
 
 /// Give a just-spawned child a short window to prove it is alive. `try_wait`
@@ -1215,6 +1233,30 @@ fn macos_launch_binary(binary: &std::path::Path, emu_name: &str, run: &str) -> R
         }
         Err(e) => Err(format!("failed to launch {}: {}", binary.display(), e)),
     }
+}
+
+/// Run a module command in the macOS system default terminal (Terminal.app)
+/// via AppleScript, with the window-reuse + pidfile lifecycle used for
+/// terminal modules. Used as the fallback when a configured emulator fails to
+/// actually run the command, and as the default when no emulator is set.
+fn terminal_app_launch(name: &str, marker: &str, run: &str, pidfile: &std::path::Path) -> Result<std::process::Child, String> {
+    kill_stale_terminal_processes(name);
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\nset wins to (every window whose name contains \"{}\")\nif (count of wins) is 0 then\ndo script \"{}\"\nelse\nset w to item 1 of wins\nrepeat with i from (count of wins) to 2 by -1\nclose (item i of wins) saving no\nend repeat\ndo script \"{}\" in w\nend if\nend tell",
+        apple_quote(marker),
+        apple_quote(run),
+        apple_quote(run),
+    );
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(&script).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let _ = pidfile;
+    cmd.spawn()
+        .map_err(|e| format!("failed to open the system terminal: {}", e))
 }
 
 /// Run `run` in the macOS system default terminal (Terminal.app) via
@@ -1758,48 +1800,35 @@ pub fn spawn_terminal_from_parts(
                         use std::os::unix::process::CommandExt;
                         cmd.process_group(0);
                     }
-                    // Give the emulator ~3s to prove it is alive. Some emulators
-                    // exit immediately when handed args they don't understand
-                    // (e.g. a binary that rejects `-e`), which would leave the
-                    // module spinning in "waiting to connect" forever. If the
-                    // process dies within the window, fall back to the system
-                    // default terminal (Terminal.app via AppleScript below).
+                    // Give the emulator ~3s to prove it actually ran the inner
+                    // command: the command writes the module's per-launch
+                    // pidfile on startup. Some emulators exit immediately when
+                    // handed args they don't understand (e.g. kitty rejects
+                    // `-e`), which would leave the module spinning in
+                    // "waiting to connect" forever. If no pidfile appears
+                    // within the window, fall back to the system default
+                    // terminal (Terminal.app via AppleScript below).
                     if let Ok(mut child) = cmd.spawn() {
-                        if wait_for_process_alive(&mut child, std::time::Duration::from_secs(3)) {
-                            return Ok((child, None, None));
+                        if wait_for_pidfile(&pidfile, std::time::Duration::from_secs(3)) {
+                            return Ok((child, None, Some(pidfile)));
                         }
+                        let _ = child.kill();
                     }
                     let _ = cmd;
+                    // The configured emulator did not run the command. Fall
+                    // back to the system default terminal — Terminal.app has
+                    // native AppleScript support and is always available on
+                    // macOS. The pidfile + window-reuse mechanism applies, so
+                    // the module still gets a usable window and lifecycle.
+                    return terminal_app_launch(&p.manifest.name, &marker, &run, &pidfile)
+                        .map(|child| (child, Some(marker), Some(pidfile)))
+                        .map_err(|e| format!("Failed to launch '{}' in the system terminal: {}", p.manifest.name, e));
                 }
             }
             // Terminal.app (or an unresolved emulator): use AppleScript, which
             // Terminal supports natively (with the window-reuse + pidfile
             // mechanism below).
-            let app_clause = match &resolved {
-                Some(r) => match &r.bundle_id {
-                    Some(id) => format!("id \"{}\"", apple_quote(id)),
-                    None => format!("\"{}\"", apple_quote(configured)),
-                },
-                None => format!("\"{}\"", apple_quote(configured)),
-            };
-            kill_stale_terminal_processes(&p.manifest.name);
-            let script = format!(
-                "tell application {}\nactivate\nset wins to (every window whose name contains \"{}\")\nif (count of wins) is 0 then\ndo script \"{}\"\nelse\nset w to item 1 of wins\nrepeat with i from (count of wins) to 2 by -1\nclose (item i of wins) saving no\nend repeat\ndo script \"{}\" in w\nend if\nend tell",
-                app_clause,
-                apple_quote(&marker),
-                apple_quote(&run),
-                apple_quote(&run),
-            );
-            let mut cmd = Command::new("osascript");
-            cmd.arg("-e").arg(&script).stdout(Stdio::null()).stderr(Stdio::null());
-            // Own process group (PGID = child PID) so a group TERM/KILL later
-            // reaches the launcher and anything it spawned.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                cmd.process_group(0);
-            }
-            cmd.spawn()
+            terminal_app_launch(&p.manifest.name, &marker, &run, &pidfile)
                 .map(|child| (child, Some(marker), Some(pidfile)))
                 .map_err(|e| format!("Failed to launch '{}' in {}: {}", p.manifest.name, configured, e))
         }
@@ -3963,5 +3992,24 @@ mod tests {
         assert!(wait_for_process_alive(&mut live, std::time::Duration::from_secs(1)));
         let _ = live.kill();
         let _ = live.wait();
+    }
+
+    #[test]
+    fn wait_for_pidfile_detects_written_pidfile() {
+        let dir = std::env::temp_dir().join(format!("ckt-pidfile-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.pid");
+        // Not present yet: times out false.
+        assert!(!wait_for_pidfile(&path, std::time::Duration::from_millis(300)));
+        // Written after a beat: becomes true.
+        std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::fs::write(&path, "123").unwrap();
+            }
+        });
+        assert!(wait_for_pidfile(&path, std::time::Duration::from_secs(2)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
