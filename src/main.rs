@@ -1260,8 +1260,10 @@ async fn handle_input_event(
                     return Ok(false);
                 }
                 match key.code {
-                    KeyCode::Up => { state.dropdown.cursor_up(); return Ok(false); }
-                    KeyCode::Down => { state.dropdown.cursor_down(); return Ok(false); }
+                    // j/k are the TUI-wide vim nav keys; the dropdown honours
+                    // them alongside the arrows so navigation is consistent.
+                    KeyCode::Up | KeyCode::Char('k') => { state.dropdown.cursor_up(); return Ok(false); }
+                    KeyCode::Down | KeyCode::Char('j') => { state.dropdown.cursor_down(); return Ok(false); }
                     KeyCode::Enter | KeyCode::Char('y') => {
                         let choice = crate::bsp::ViewType::all()[state.dropdown.cursor];
                         let target = state.dropdown.open_for.clone();

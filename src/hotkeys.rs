@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn the_new_keymap_schema_loads() {
         // The NEW_UI spec schema: global_context + window_management.
-        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hotkey_config.json");
         std::fs::write(&path, r#"{
@@ -674,7 +674,7 @@ mod tests {
         );
         // And WindowToggle parses from the new-schema file like any other
         // global action.
-        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hotkey_config.json");
         std::fs::write(&path, r#"{
