@@ -2201,6 +2201,7 @@ async fn handle_launch_result(
             &args,
             emulator.as_deref(),
         )
+        .await
     } else {
         supervisor::spawn_from_parts(plugin, &cmd, &args).map(|c| (c, None, None))
     };

@@ -1167,6 +1167,12 @@ fn macos_launch_args(emu: &str) -> Vec<String> {
 /// pidfile as the FIRST thing the inner command does, so its appearance proves
 /// the terminal actually ran the command — not just that the emulator GUI is
 /// alive. Returns true once the file exists.
+///
+/// The emulator-launch path uses [`wait_for_pidfile_or_child_exit`] (which also
+/// watches the child exit, so a slow cold start and a rejected-args crash are
+/// both handled); this plain variant remains as the tested building block and
+/// is exercised by the tests below.
+#[cfg(test)]
 fn wait_for_pidfile(path: &std::path::Path, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -1176,6 +1182,51 @@ fn wait_for_pidfile(path: &std::path::Path, timeout: std::time::Duration) -> boo
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     path.exists()
+}
+
+/// Wait up to `timeout` for the module's pidfile, but stop as soon as the
+/// emulator CHILD process exits.
+///
+/// The two failure modes of an emulator launch pull in opposite directions:
+/// an emulator that REJECTS its launch args (e.g. kitty handed `-e`, which it
+/// doesn't understand) quits within a second or two, and a working emulator on
+/// a COLD start can take ten-plus seconds to open its first window and run the
+/// inner command (the very first launch of a terminal module is the slowest —
+/// the emulator GUI, its first shell, the `cd` into a cold module dir and the
+/// nested `sh` all have to come up before the pidfile is written). A single
+/// short timeout falls back to Terminal.app on that slow first launch; a long
+/// timeout leaves the module "starting" forever when the args were rejected.
+/// Watching the child threads the difference: the reject case exits fast, so
+/// the wait returns quickly; the cold-start case stays alive until its pidfile
+/// lands, however long that takes.
+///
+/// Async so the supervisor's main loop stays responsive while a cold emulator
+/// takes its time (a synchronous sleep here would freeze the TUI for the whole
+/// first launch).
+async fn wait_for_pidfile_or_child_exit(
+    child: &mut std::process::Child,
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        match child.try_wait() {
+            // The emulator process died — it rejected the args or crashed, so
+            // the pidfile will never appear. Fall back now instead of hanging.
+            Ok(Some(_)) | Err(_) => return false,
+            // Still running: keep waiting until the pidfile appears or the
+            // timeout expires.
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return path.exists();
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Give a just-spawned child a short window to prove it is alive. `try_wait`
@@ -1699,7 +1750,7 @@ pub fn pid_alive(pid: i32) -> bool {
 /// a close-then-reopen launch can stack windows (e.g. during a crash-loop).
 /// Any stale process for the same module is killed first, so a module never
 /// ends up with two instances.
-pub fn spawn_terminal_from_parts(
+pub async fn spawn_terminal_from_parts(
     p: &Plugin,
     cmd: &str,
     args: &[String],
@@ -1800,16 +1851,25 @@ pub fn spawn_terminal_from_parts(
                         use std::os::unix::process::CommandExt;
                         cmd.process_group(0);
                     }
-                    // Give the emulator ~3s to prove it actually ran the inner
+                    // Give the emulator time to prove it actually ran the inner
                     // command: the command writes the module's per-launch
-                    // pidfile on startup. Some emulators exit immediately when
-                    // handed args they don't understand (e.g. kitty rejects
-                    // `-e`), which would leave the module spinning in
-                    // "waiting to connect" forever. If no pidfile appears
-                    // within the window, fall back to the system default
-                    // terminal (Terminal.app via AppleScript below).
+                    // pidfile on startup. The wait is generous (a COLD first
+                    // launch of a terminal module can take ten-plus seconds to
+                    // open the window and run the wrapper), but breaks early if
+                    // the emulator process exits — that is the "rejects the
+                    // args" case (e.g. kitty handed `-e`), where waiting would
+                    // leave the module spinning in "waiting to connect"
+                    // forever. Only when the emulator stays alive AND the
+                    // pidfile never appears within the window do we fall back
+                    // to the system default terminal (Terminal.app below).
                     if let Ok(mut child) = cmd.spawn() {
-                        if wait_for_pidfile(&pidfile, std::time::Duration::from_secs(3)) {
+                        if wait_for_pidfile_or_child_exit(
+                            &mut child,
+                            &pidfile,
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await
+                        {
                             return Ok((child, None, Some(pidfile)));
                         }
                         let _ = child.kill();
@@ -3048,7 +3108,9 @@ mod tests {
             manifest,
             directory: "/tmp/m".into(),
         };
-        let (child, marker, pidfile) = spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None)
+        let (child, marker, pidfile) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None))
             .expect("spawn");
         eprintln!("marker={:?} pidfile={:?}", marker, pidfile);
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -3133,8 +3195,10 @@ mod tests {
         };
 
         // First launch: one window.
-        let (_child1, marker1, pidfile1) =
-            spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None).expect("spawn 1");
+        let (_child1, marker1, pidfile1) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None))
+            .expect("spawn 1");
         std::thread::sleep(std::time::Duration::from_secs(2));
         assert_eq!(count_windows().lines().count(), 1, "first launch must open exactly one window");
         let pid1 = std::fs::read_to_string(pidfile1.as_ref().unwrap())
@@ -3150,8 +3214,10 @@ mod tests {
 
         // Relaunch (the supervisor's crash ladder path): must reuse the SAME
         // window, not stack a second one.
-        let (_child2, marker2, pidfile2) =
-            spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None).expect("spawn 2");
+        let (_child2, marker2, pidfile2) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(spawn_terminal_from_parts(&plugin, "/bin/sleep", &["90".to_string()], None))
+            .expect("spawn 2");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let windows = count_windows();
         eprintln!("windows after relaunch: {:?}", windows);
@@ -4011,6 +4077,64 @@ mod tests {
             }
         });
         assert!(wait_for_pidfile(&path, std::time::Duration::from_secs(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_pidfile_or_child_exit_returns_fast_on_emulator_exit() {
+        // The emulator REJECTS its args and exits immediately: the wait must
+        // return false fast (not hang for the whole generous timeout) so the
+        // launcher falls back to Terminal.app.
+        let dir = std::env::temp_dir().join(format!("ckt-wait-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.pid");
+        let mut dead = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pidfile_or_child_exit(
+            &mut dead,
+            &path,
+            std::time::Duration::from_secs(30),
+        ));
+        assert!(!ok, "a dead emulator must be reported as a failed launch");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must return promptly when the emulator exits, took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_pidfile_or_child_exit_waits_for_live_emulator_pidfile() {
+        // A live emulator that is slow to start (the cold first launch): the
+        // wait must hold until the pidfile lands, past a short timeout.
+        let dir = std::env::temp_dir().join(format!("ckt-wait-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.pid");
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        std::thread::spawn({
+            let path = path.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                std::fs::write(&path, "123").unwrap();
+            }
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pidfile_or_child_exit(
+            &mut live,
+            &path,
+            std::time::Duration::from_secs(30),
+        ));
+        assert!(ok, "a live emulator whose pidfile appears must be a success");
+        let _ = live.kill();
+        let _ = live.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
