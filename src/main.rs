@@ -1253,9 +1253,9 @@ async fn handle_input_event(
             // while it is open: arrows move, confirm swaps the view, deny/esc
             // closes without changing anything.
             if state.dropdown.is_open() {
-                // Window toggle (Ctrl+Tab by default) closes an open dropdown —
+                // Window toggle (Shift+T by default) closes an open dropdown —
                 // the same key that opened it acts as a toggle.
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Tab {
+                if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Char('T') {
                     state.dropdown.close();
                     return Ok(false);
                 }

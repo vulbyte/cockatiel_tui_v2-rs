@@ -87,7 +87,7 @@ pub enum Action {
     /// pops out a separate window.
     OpenUsers,
     /// Open the per-pane view-type dropdown (the `[v] view_type` header menu)
-    /// for the focused pane. Bound to Ctrl+Tab by default (the "window toggle"
+    /// for the focused pane. Bound to Shift+T by default (the "window toggle"
     /// — switch what window a pane shows). Same action as clicking the `[v]`
     /// header or pressing Ctrl+T.
     WindowToggle,
@@ -544,11 +544,11 @@ pub fn default_hotkeys() -> HotkeyConfig {
     global.insert(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), Action::SplitVertical);
     global.insert(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL), Action::SplitHorizontal);
     global.insert(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), Action::JoinPanes);
-    // Ctrl+Tab opens the view-type dropdown for the focused pane (the "window
+    // Shift+T opens the view-type dropdown for the focused pane (the "window
     // toggle" — switch what window a pane shows). Same as clicking the `[v]`
-    // header or Ctrl+T; Ctrl+Tab is the mnemonic for cycling windows and
-    // collides with nothing (plain Tab focuses the next pane).
-    global.insert(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL), Action::WindowToggle);
+    // header or Ctrl+T; Shift+T is unbound elsewhere (Ctrl+Tab was the first
+    // choice but terminals and tmux contest it for their own window switching).
+    global.insert(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), Action::WindowToggle);
     // `p` → pause/resume the engine's dispatch gate. Global, because the gate
     // is engine-wide: an operator must be able to resume from any window, not
     // just the modules one. `p` was chosen for the mnemonic and because it is
@@ -560,10 +560,12 @@ pub fn default_hotkeys() -> HotkeyConfig {
     // divisor). Global, like the pause toggle, so it works from any window; `U`
     // is free (not bound elsewhere) and reads as "User DB".
     global.insert(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT), Action::EditUserDbConfig);
-    // `T` opens the TUI's own config editor (launch_engine / auto_start /
-    // terminal_emulator). Global like `U`, so it works from any window; `T`
-    // is free (not bound elsewhere) and reads as "TUI config".
-    global.insert(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), Action::EditTuiConfig);
+    // `Ctrl+Shift+T` opens the TUI's own config editor (launch_engine /
+    // auto_start / terminal_emulator). Plain `T` (Shift+T) is the window toggle
+    // (view-type dropdown), so the TUI-config editor moves to Ctrl+Shift+T to
+    // keep the "T = TUI config" mnemonic without clashing. Global like `U`, so
+    // it works from any window.
+    global.insert(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::CONTROL | KeyModifiers::SHIFT), Action::EditTuiConfig);
     // `a` toggles per-module autostart (the `A` marker in the modules window);
     // autostart modules launch automatically on engine connect, so there is no
     // session-level toggle to bind.
@@ -658,25 +660,31 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_tab_binds_window_toggle_by_default_and_from_file() {
-        // Default: Ctrl+Tab opens the view-type dropdown (window toggle).
+    fn shift_t_binds_window_toggle_by_default_and_from_file() {
+        // Default: Shift+T opens the view-type dropdown (window toggle).
         let cfg = default_hotkeys();
         assert_eq!(
-            cfg.global.get(&KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
             Some(&Action::WindowToggle)
         );
-        // And it parses from the new-schema file like any other global action.
+        // Shift+T was the TUI-config editor; it moves to Ctrl+Shift+T.
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('T'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            Some(&Action::EditTuiConfig)
+        );
+        // And WindowToggle parses from the new-schema file like any other
+        // global action.
         let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hotkey_config.json");
         std::fs::write(&path, r#"{
             "global_context": {
-                "Ctrl+Tab": "WindowToggle"
+                "Shift+T": "WindowToggle"
             }
         }"#).unwrap();
         let cfg = load_hotkeys(&path);
         assert_eq!(
-            cfg.global.get(&KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            cfg.global.get(&KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT)),
             Some(&Action::WindowToggle)
         );
         let _ = std::fs::remove_dir_all(&dir);
