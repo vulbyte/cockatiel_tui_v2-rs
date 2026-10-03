@@ -1253,6 +1253,12 @@ async fn handle_input_event(
             // while it is open: arrows move, confirm swaps the view, deny/esc
             // closes without changing anything.
             if state.dropdown.is_open() {
+                // Window toggle (Ctrl+Tab by default) closes an open dropdown —
+                // the same key that opened it acts as a toggle.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Tab {
+                    state.dropdown.close();
+                    return Ok(false);
+                }
                 match key.code {
                     KeyCode::Up => { state.dropdown.cursor_up(); return Ok(false); }
                     KeyCode::Down => { state.dropdown.cursor_down(); return Ok(false); }
@@ -1888,6 +1894,7 @@ fn is_dispatchable(action: &Action) -> bool {
             | Action::SplitVertical
             | Action::SplitHorizontal
             | Action::JoinPanes
+            | Action::WindowToggle
     )
 }
 
@@ -2703,6 +2710,16 @@ async fn dispatch_action(
                     "users: no top_users pane mounted — split a pane and pick top_users from the view dropdown (Ctrl+T)".to_string(),
                 );
             }
+            return Ok(false);
+        }
+        Action::WindowToggle => {
+            // Open the view-type dropdown for the focused pane (the "window
+            // toggle" — switch what window a pane shows). Same as clicking
+            // the `[v]` header or Ctrl+T.
+            let leaf_id = state.tree.focused_id();
+            let view = state.tree.focused_view();
+            state.dropdown.open(&leaf_id, view);
+            state.force_full_redraw = true;
             return Ok(false);
         }
         Action::PopOut(window_name) => {

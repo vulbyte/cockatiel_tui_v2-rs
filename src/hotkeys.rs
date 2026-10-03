@@ -86,6 +86,11 @@ pub enum Action {
     /// themselves via split + the view dropdown). Never auto-splits and never
     /// pops out a separate window.
     OpenUsers,
+    /// Open the per-pane view-type dropdown (the `[v] view_type` header menu)
+    /// for the focused pane. Bound to Ctrl+Tab by default (the "window toggle"
+    /// — switch what window a pane shows). Same action as clicking the `[v]`
+    /// header or pressing Ctrl+T.
+    WindowToggle,
     Noop,
 }
 
@@ -214,6 +219,7 @@ fn parse_action(s: &str) -> Action {
         "SplitHorizontal" => Action::SplitHorizontal,
         "JoinPanes" => Action::JoinPanes,
         "OpenUsers" => Action::OpenUsers,
+        "WindowToggle" => Action::WindowToggle,
         _ => Action::Noop,
     }
 }
@@ -314,6 +320,7 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::SplitVertical => "split-v",
         Action::SplitHorizontal => "split-h",
         Action::JoinPanes => "join",
+        Action::WindowToggle => "window-toggle",
         Action::OpenUsers => "users",
         Action::Quit => "quit",
         Action::FocusNext => "window-next",
@@ -537,6 +544,11 @@ pub fn default_hotkeys() -> HotkeyConfig {
     global.insert(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), Action::SplitVertical);
     global.insert(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL), Action::SplitHorizontal);
     global.insert(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), Action::JoinPanes);
+    // Ctrl+Tab opens the view-type dropdown for the focused pane (the "window
+    // toggle" — switch what window a pane shows). Same as clicking the `[v]`
+    // header or Ctrl+T; Ctrl+Tab is the mnemonic for cycling windows and
+    // collides with nothing (plain Tab focuses the next pane).
+    global.insert(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL), Action::WindowToggle);
     // `p` → pause/resume the engine's dispatch gate. Global, because the gate
     // is engine-wide: an operator must be able to resume from any window, not
     // just the modules one. `p` was chosen for the mnemonic and because it is
@@ -641,6 +653,31 @@ mod tests {
         assert!(
             cfg.window_actions.get("panes").is_some(),
             "window_management must populate the panes group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_tab_binds_window_toggle_by_default_and_from_file() {
+        // Default: Ctrl+Tab opens the view-type dropdown (window toggle).
+        let cfg = default_hotkeys();
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            Some(&Action::WindowToggle)
+        );
+        // And it parses from the new-schema file like any other global action.
+        let dir = std::env::temp_dir().join(format!("ck-hotkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hotkey_config.json");
+        std::fs::write(&path, r#"{
+            "global_context": {
+                "Ctrl+Tab": "WindowToggle"
+            }
+        }"#).unwrap();
+        let cfg = load_hotkeys(&path);
+        assert_eq!(
+            cfg.global.get(&KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL)),
+            Some(&Action::WindowToggle)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

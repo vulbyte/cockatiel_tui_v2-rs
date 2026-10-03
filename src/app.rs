@@ -515,6 +515,9 @@ impl AppState {
                 Action::SplitVertical => return Some(Action::SplitVertical),
                 Action::SplitHorizontal => return Some(Action::SplitHorizontal),
                 Action::JoinPanes => return Some(Action::JoinPanes),
+                // Ctrl+Tab (window toggle): open the view-type dropdown for
+                // the focused pane, from any window.
+                Action::WindowToggle => return Some(Action::WindowToggle),
                 _ => {}
             }
         }
