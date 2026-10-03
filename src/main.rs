@@ -3718,6 +3718,7 @@ mod tests {
                     autostart: false,
 
                     authority: 0,
+                    price: 0,
                 })
                 .collect();
             s
@@ -3861,6 +3862,7 @@ mod tests {
                 autostart: false,
 
                 authority: 0,
+                price: 0,
             }];
 
             // Filled in by `fill_window_action` for a real keypress. With the
@@ -4166,6 +4168,7 @@ mod engine_lifecycle_tests {
             autostart: false,
 
             authority: 0,
+            price: 0,
         }];
         s.stats.connection = db::ConnectionInfo { ip: "127.0.0.1".into(), port: 9734, pin: 4242 };
         s

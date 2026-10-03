@@ -262,6 +262,23 @@ fn format_ms(avg_ms: Option<f32>) -> String {
     }
 }
 
+/// The points-cost marker for a module's per-use price, right-aligned in the
+/// price column. `0` (free) shows a blank — the column only lights up when a
+/// module actually costs points, so a free module reads as cleanly as an
+/// ungated one. A nonzero price shows the number with a `p` suffix (points).
+///
+/// ASCII-only on purpose: every column in the row is padded by CHARACTER
+/// count and the ms column must land on the same cell x for every row. A
+/// fullwidth glyph (like `◆`) consumes 2 cells but 1 char, silently shifting
+/// the ms column one cell right on every paid row.
+fn format_price(price: u32) -> String {
+    if price == 0 {
+        String::new()
+    } else {
+        format!("{price}p")
+    }
+}
+
 /// How many messages/minute the engine could sustain at `total_ms` average
 /// end-to-end latency before the queue starts filling (the inverse of the
 /// per-message latency: `1000/ms` messages/sec, × 60 = `60000/ms`/min). Blank
@@ -336,6 +353,12 @@ const AUTOSTART_COL: usize = 2;
 /// shown on every module row after the status. The engine row pads to the same
 /// width so the ms column stays aligned across rows.
 const AUTHORITY_TAG_COL: usize = 8;
+
+/// The fixed width of the points-cost column on every module row. Shows the
+/// module's per-use price (`0` = free) so the operator sees at a glance how
+/// much score a user spends to trigger it. Blank for the engine, which has no
+/// gate of its own; the ms column stays aligned across rows.
+const PRICE_COL: usize = 6;
 
 /// The fixed width of the ms column, right-aligned within it so `7.3ms` and
 /// `157.3ms` share a right edge.
@@ -1747,7 +1770,7 @@ impl Window for ModulesWindow {
                             // the same 2-space row indent + the authority tag a
                             // module row has (the header label carries the
                             // indent too).
-                            let ms_start = 2 + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + AUTOSTART_COL;
+                            let ms_start = 2 + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + PRICE_COL + AUTOSTART_COL;
                             let pad = ms_start.saturating_sub(header_name.len());
                             let header_style = if is_selected {
                                 row_style
@@ -1846,8 +1869,8 @@ impl Window for ModulesWindow {
                             let total_text = format_ms(Some(total_ms));
                             let indent = 2;
                             // Matches the module rows: name + status + authority
-                            // tag (+leading space) + autostart, then the ms col.
-                            let ms_start = indent + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + AUTOSTART_COL;
+                            // tag (+leading space) + price + autostart, then the ms col.
+                            let ms_start = indent + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + PRICE_COL + AUTOSTART_COL;
                             let ms_right = ms_start + MS_COL;
                             // Everything rendered so far: name + status. The
                             // badge (if any) then the ms must end at `ms_right`.
@@ -1937,6 +1960,19 @@ impl Window for ModulesWindow {
                                     Color::Black
                                 } else {
                                     Color::Magenta
+                                }),
+                            ));
+                            // Points cost (from the manifest): what a user's
+                            // score is charged when the module runs on their
+                            // message. `0` = free. Shown right-aligned after the
+                            // authority tag so the price column is fixed and the
+                            // autostart + ms columns stay put.
+                            spans.push(Span::styled(
+                                format!("{:>width$}", format_price(module.price), width = PRICE_COL),
+                                row_style.fg(if is_selected {
+                                    Color::Black
+                                } else {
+                                    Color::DarkGray
                                 }),
                             ));
                             // Autostart marker: `A` for a module set to start
@@ -2394,6 +2430,7 @@ mod tests {
             autostart: false,
 
             authority: 0,
+            price: 0,
         }
     }
 
@@ -4290,6 +4327,56 @@ mod engine_row_tests {
             !screen.contains("category average"),
             "the header label must be removed: {screen}"
         );
+    }
+
+    /// The points-cost column shows a paid module's price and stays blank for
+    /// a free one, right-aligned to a fixed column so the autostart + ms
+    /// columns do not shift between rows.
+    #[test]
+    fn the_price_column_shows_the_per_use_cost_and_stays_aligned() {
+        let mut w = super::ModulesWindow::new();
+        let mut stats = stats_with(&[
+            ("tts-service", "postprocess"),
+            ("banned-words", "preprocess"),
+        ]);
+        stats
+            .module_entries
+            .iter_mut()
+            .find(|m| m.name == "tts-service")
+            .unwrap()
+            .price = 15;
+        let screen = super::tests::render(&mut w, &stats, 120, 30);
+
+        let line = |needle: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
+        };
+        assert!(line("tts-service").contains("15p"), "paid module must show its price");
+        assert!(
+            !line("banned-words").contains("p"),
+            "free module must not show a cost glyph"
+        );
+        // Give both modules a timing so the ms column renders identically.
+        stats.module_entries.iter_mut().for_each(|m| m.avg_ms = Some(4.2));
+        let screen2 = super::tests::render(&mut w, &stats, 120, 30);
+        let line2 = |needle: &str| {
+            screen2
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{screen2}"))
+        };
+        assert_eq!(
+            ms_end_in(&line2("tts-service")),
+            ms_end_in(&line2("banned-words")),
+            "both rows must end at the same fixed ms column"
+        );
+    }
+
+    fn ms_end_in(line: &str) -> usize {
+        let ms = "4.2ms";
+        line.find(ms).unwrap() + ms.len()
     }
 
     /// The engine's end-to-end latency is shown in ONE place (the engine row,

@@ -3948,6 +3948,7 @@ mod tests {
             autostart: false,
 
             authority: 0,
+            price: 0,
         };
         // Simulate the stale pre-poll state: alpha was moved to the head of the
         // chain by a Shift+up, but the local entries still show the old order.

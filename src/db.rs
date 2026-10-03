@@ -30,6 +30,9 @@ pub struct ModuleStatus {
     /// The module's authority gate level (0=user, 1=mod, 2=admin, 3=owner),
     /// from its manifest.
     pub authority: u32,
+    /// How much score a user must spend for the module to run on their
+    /// message, from its manifest. 0 = free.
+    pub price: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -425,6 +428,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                         let avg_ms = row.get("avg_ms").and_then(|v| v.as_f64()).map(|f| f as f32);
                         let autostart = row.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
                         let authority = row.get("authority").and_then(|v| v.as_u64()).map(|x| x as u32).unwrap_or(1);
+                        let price = row.get("price").and_then(|v| v.as_u64()).map(|x| x as u32).unwrap_or(0);
 
                         stats.module_entries.push(ModuleStatus {
                             name: name.to_string(),
@@ -438,6 +442,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                             avg_ms,
                             autostart,
                             authority,
+                            price,
                         });
                     }
                 }
@@ -850,6 +855,7 @@ mod tests {
                 autostart: false,
 
                 authority: 0,
+                price: 0,
             }],
             connection: ConnectionInfo { ip: "10.0.0.1".into(), port: 9734, pin: 123456 },
             pipeline_paused: false,
