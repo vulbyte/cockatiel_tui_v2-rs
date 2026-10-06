@@ -76,11 +76,10 @@ fn clear_json_values(v: &mut serde_json::Value) {
     }
 }
 
-/// Where the engine lives relative to the TUI crate.
+/// Where the engine lives. Resolved at runtime by [`crate::paths`] so the TUI
+/// runs from a self-contained install root as well as the monorepo checkout.
 pub fn engine_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("cockatiel_engine-rs")
+    crate::paths::current().engine_dir.clone()
 }
 
 pub fn engine_config_path() -> PathBuf {
@@ -589,9 +588,9 @@ pub fn remediate_secret_file_permissions() {
     ] {
         chmod_0600_best_effort(&p);
     }
-    if let Some(modules_dir) = Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("modules")) {
-        chmod_env_files_best_effort(&modules_dir);
-    }
+    // Modules can live under a runtime-resolved root (installed layout) or the
+    // monorepo `modules/` tree (legacy); the resolver knows which.
+    chmod_env_files_best_effort(&modules_dir());
 }
 
 fn chmod_0600_best_effort(path: &Path) {
@@ -645,15 +644,16 @@ pub fn user_db_backup_path() -> PathBuf {
 /// The engine is always pointed at the user database the supervisor launches.
 pub fn launch_engine() -> Result<Child, String> {
     let dir = engine_dir();
-    let binary = dir.join("target").join("release").join("cockatiel-engine-rs");
-    let binary = if binary.exists() {
-        binary
-    } else {
-        dir.join("target").join("debug").join("cockatiel-engine-rs")
-    };
-    if !binary.exists() {
-        return Err(format!("Engine binary not found at {}", binary.display()));
-    }
+    let binary = crate::paths::engine_binary().ok_or_else(|| {
+        format!(
+            "Engine binary not found; checked {}",
+            crate::paths::binary_candidates(&dir, "cockatiel-engine-rs")
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
 
     let log_path = dir.join("engine.log");
     // Bound the log file: rotate any engine.log past 10 MB before the engine
@@ -671,6 +671,7 @@ pub fn launch_engine() -> Result<Child, String> {
         .env("USER_DB_TOKEN", user_db_token())
         .env("USER_DB_BACKUP_PATH", user_db_backup_path().to_string_lossy().to_string())
         .env("COCKATIEL_RANK_CHART", rank_chart_path().to_string_lossy().to_string())
+        .env("COCKATIEL_MODULE_PATHS", modules_dir().to_string_lossy().to_string())
         .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log_file));
     // Own process group (PGID = child PID) so a group TERM/KILL later reaches
@@ -684,30 +685,34 @@ pub fn launch_engine() -> Result<Child, String> {
         .map_err(|e| format!("Failed to launch engine: {}", e))
 }
 
-/// Where the user database service lives relative to the TUI crate.
+/// Where the user database service lives. Resolved at runtime by
+/// [`crate::paths`] (installed `<root>/user-db`, else the legacy sibling).
 pub fn user_db_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("cockatiel_user_database-rs")
+    crate::paths::current().user_db_dir.clone()
 }
 
-/// The TUI's own directory. Config files (`config.json`, `hotkey_config.json`,
-/// `color_config.json`, `layout.json`) always live HERE, regardless of the
-/// launch working directory — so running the TUI from anywhere (repo root,
-/// another cwd) reads the same config. The engine launches with its own CWD and
-/// looks for `../config.json`, so if the TUI resolved its config from
+/// The modules directory: the `--modules-dir` override when set, else the
+/// resolved layout's default.
+pub fn modules_dir() -> PathBuf {
+    crate::paths::modules_dir()
+}
+
+/// The TUI's own config directory. Config files (`config.json`,
+/// `hotkey_config.json`, `color_config.json`, `layout.json`) always live HERE,
+/// regardless of the launch working directory — so running the TUI from
+/// anywhere (repo root, another cwd) reads the same config. Installed layout:
+/// `<root>/config`; legacy: the TUI crate dir. The engine launches with its own
+/// CWD and looks for `../config.json`, so if the TUI resolved its config from
 /// `current_dir()` a launch from the repo root would make the engine mistake
 /// the TUI's config for its own and crash on parse.
 pub fn tui_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    crate::paths::current().tui_dir.clone()
 }
 
-/// The shared rank chart at the repo root. Injected as `COCKATIEL_RANK_CHART`
-/// into engine + module processes so every consumer reads the same tier names.
+/// The shared rank chart. Injected as `COCKATIEL_RANK_CHART` into engine +
+/// module processes so every consumer reads the same tier names.
 pub fn rank_chart_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("rank_chart.json")
+    crate::paths::current().rank_chart.clone()
 }
 
 pub const USER_DB_DEFAULT_PORT: u16 = 9736;
@@ -775,15 +780,16 @@ pub fn user_db_token() -> String {
 /// the supervisor always starts them.
 pub fn launch_user_db() -> Result<Child, String> {
     let dir = user_db_dir();
-    let binary = dir.join("target").join("release").join("cockatiel-user-database");
-    let binary = if binary.exists() {
-        binary
-    } else {
-        dir.join("target").join("debug").join("cockatiel-user-database")
-    };
-    if !binary.exists() {
-        return Err(format!("User DB binary not found at {}", binary.display()));
-    }
+    let binary = crate::paths::user_db_binary().ok_or_else(|| {
+        format!(
+            "User DB binary not found; checked {}",
+            crate::paths::binary_candidates(&dir, "cockatiel-user-database")
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
 
     let log_path = dir.join("userdb.log");
     let log_file = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
@@ -2718,6 +2724,7 @@ mod tests {
             name: "test-mod".into(),
             description: String::new(),
             version: String::new(),
+            kind: String::new(),
             capabilities: "output".into(),
             root_file: String::new(),
             launch_command: "cargo".into(),
@@ -2780,6 +2787,7 @@ mod tests {
             name: "tts-service".into(),
             description: String::new(),
             version: String::new(),
+            kind: String::new(),
             capabilities: "output".into(),
             root_file: "./tts_service.py".into(),
             launch_command: "python3".into(),
@@ -3091,6 +3099,7 @@ mod tests {
             name: "liveterm".into(),
             description: String::new(),
             version: String::new(),
+            kind: String::new(),
             capabilities: String::new(),
             root_file: String::new(),
             launch_command: String::new(),
@@ -3164,6 +3173,7 @@ mod tests {
             name: "liveterm".into(),
             description: String::new(),
             version: String::new(),
+            kind: String::new(),
             capabilities: String::new(),
             root_file: String::new(),
             launch_command: String::new(),

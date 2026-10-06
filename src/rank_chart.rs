@@ -51,15 +51,15 @@ impl RankChart {
 }
 
 fn default_chart_path() -> std::path::PathBuf {
-    // The TUI crate lives one level below the repo root; the chart is there.
+    // The environment variable the supervisor injects into children always
+    // wins; otherwise the runtime-resolved chart (installed `<root>/rank_chart.json`,
+    // legacy repo root) applies.
     if let Ok(p) = std::env::var("COCKATIEL_RANK_CHART") {
         if !p.is_empty() {
             return std::path::PathBuf::from(p);
         }
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("rank_chart.json")
+    crate::paths::current().rank_chart.clone()
 }
 
 static CHART: OnceLock<RankChart> = OnceLock::new();

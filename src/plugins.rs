@@ -68,6 +68,17 @@ pub struct ModuleManifest {
     #[serde(default)]
     pub version: String,
 
+    /// What kind of component this manifest describes. Empty (the historical
+    /// default) means a launchable pipeline module; the core components declare
+    /// `engine`/`tui`/`user-db`/`test-runner` so discovery does NOT mistake them
+    /// for modules. The TUI now ships a `cockatiel_module_info.json` of its own
+    /// (for the launcher's release metadata), and when the TUI is launched from
+    /// the repo root `discover_plugins(&cwd)` walks straight into it — without
+    /// this discriminator the TUI would list (and offer to launch) itself, the
+    /// engine, and the user database as if they were chat modules.
+    #[serde(default)]
+    pub kind: String,
+
     #[serde(default)]
     pub capabilities: String,
 
@@ -186,6 +197,33 @@ mod tests {
     }
 
     #[test]
+    fn discovery_skips_core_components_by_kind() {
+        // A `cockatiel_module_info.json` with a non-module `kind` is a core
+        // component (the engine/TUI/user-db/test-runner manifests the launcher
+        // reads), NOT a launchable plugin. A module manifest with no `kind`
+        // (every historical module) still loads.
+        let tmp = std::env::temp_dir().join(format!("cockatiel-kind-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(tmp.join("engine")).unwrap();
+        std::fs::create_dir_all(tmp.join("mod")).unwrap();
+        std::fs::write(
+            tmp.join("engine").join(MANIFEST_FILENAME),
+            r#"{"name":"engine","kind":"engine"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("mod").join(MANIFEST_FILENAME),
+            r#"{"name":"mod","launch_command":"echo"}"#,
+        )
+        .unwrap();
+
+        let found = discover_plugins(&tmp);
+        assert_eq!(found.len(), 1, "the core component must not be a plugin");
+        assert_eq!(found[0].manifest.name, "mod");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn discovery_skips_manifests_with_invalid_names() {
         let tmp = std::env::temp_dir().join(format!("cockatiel-plug-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(tmp.join("ok_mod")).unwrap();
@@ -253,6 +291,12 @@ fn load_plugin(dir: &Path) -> Option<Plugin> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
     let contents = std::fs::read_to_string(&manifest_path).ok()?;
     let manifest: ModuleManifest = serde_json::from_str(&contents).ok()?;
+    // Only pipeline modules are launchable plugins. The core components carry a
+    // non-empty `kind` (engine/tui/user-db/test-runner) so a recursive walk over
+    // the checkout does not register them as modules.
+    if !manifest.kind.is_empty() && manifest.kind != "module" {
+        return None;
+    }
     if !is_valid_module_name(&manifest.name) {
         eprintln!(
             "[plugins] skipping {}: invalid module name {:?} — must match ^[A-Za-z0-9_-]+$ (no spaces, shell metacharacters, path separators, or '.'/'..')",

@@ -6,6 +6,7 @@ mod rank_chart;
 mod event;
 mod hotkeys;
 mod layout;
+mod paths;
 mod plugins;
 mod supervisor;
 mod tts;
@@ -15,6 +16,7 @@ mod ws_server;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -127,6 +129,13 @@ pub struct CliArgs {
     /// `None` (the config decides). The LAST one given wins, so
     /// `--no-engine --with-engine` means what it reads as.
     pub engine_launch: Option<bool>,
+    /// `--install-root <path>`: run from a self-contained install root instead
+    /// of the monorepo layout (see [`crate::paths`]). `None` falls back to
+    /// `COCKATIEL_HOME`, then exe detection, then the legacy layout.
+    pub install_root: Option<PathBuf>,
+    /// `--modules-dir <path>`: override just the modules directory (installed
+    /// modules may live outside the install root).
+    pub modules_dir: Option<PathBuf>,
 }
 
 fn parse_cli(args: &[String]) -> CliArgs {
@@ -160,6 +169,10 @@ fn parse_cli(args: &[String]) -> CliArgs {
             out.override_port = take(&mut i).and_then(|v| v.parse().ok());
         } else if args[i] == "--pin" {
             out.override_pin = take(&mut i).and_then(|v| v.parse().ok());
+        } else if args[i] == "--install-root" {
+            out.install_root = take(&mut i).map(PathBuf::from);
+        } else if args[i] == "--modules-dir" {
+            out.modules_dir = take(&mut i).map(PathBuf::from);
         } else if args[i] == "--with-engine" {
             // No value: these two SWITCH, they are not `--flag value`.
             out.engine_launch = Some(true);
@@ -203,6 +216,9 @@ pub fn engine_start_decision(already_up: bool, should_launch: bool) -> bool {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let cli = parse_cli(&args[1..]);
+    // Resolve the install layout FIRST: every path accessor below
+    // (`tui_dir`, `engine_dir`, the module discovery dir) reads this cache.
+    crate::paths::init(cli.install_root.clone(), cli.modules_dir.clone());
     let detached_window = cli.detached_window;
     let ws_parent_addr = cli.ws_parent_addr;
     let ws_parent_token = cli.ws_parent_token;
@@ -347,15 +363,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if let Some(repo_modules) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|p| p.join("modules"))
-        {
-            if repo_modules.exists() {
-                for p in crate::plugins::discover_plugins(&repo_modules) {
-                    if !discovered.iter().any(|x| x.manifest.name == p.manifest.name) {
-                        discovered.push(p);
-                    }
+        // The configured modules directory (installed `<root>/modules`, legacy
+        // monorepo `modules/`, or a `--modules-dir` override) — resolved at
+        // runtime so a relocated install still finds its modules.
+        let modules_dir = crate::supervisor::modules_dir();
+        if modules_dir.exists() {
+            for p in crate::plugins::discover_plugins(&modules_dir) {
+                if !discovered.iter().any(|x| x.manifest.name == p.manifest.name) {
+                    discovered.push(p);
                 }
             }
         }
@@ -3789,6 +3804,7 @@ mod tests {
                     name: name.to_string(),
                     description: String::new(),
                     version: String::new(),
+                    kind: String::new(),
                     capabilities: String::new(),
                     root_file: String::new(),
                     launch_command: String::new(),
@@ -4962,8 +4978,15 @@ mod engine_lifecycle_tests {
                 override_port: Some(1111),
                 override_pin: Some(2222),
                 engine_launch: None,
+                install_root: None,
+                modules_dir: None,
             }
         );
+        // The install-root / modules-dir value flags parse like every other
+        // value flag.
+        let located = parse_cli(&args(&["--install-root", "/opt/cockatiel", "--modules-dir", "/srv/modules"]));
+        assert_eq!(located.install_root, Some(PathBuf::from("/opt/cockatiel")));
+        assert_eq!(located.modules_dir, Some(PathBuf::from("/srv/modules")));
         assert_eq!(parse_cli(&args(&["-p", "1234"])).override_port, Some(1234));
         assert_eq!(parse_cli(&args(&["--pin", "4321"])).override_pin, Some(4321));
         // A value flag with nothing after it is stepped over, not a panic — and
