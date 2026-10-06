@@ -1,0 +1,49 @@
+{
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/cockatiel-tui-v2",
+      "arm": "target/release/cockatiel-tui-v2",
+      "x86": "target/release/cockatiel-tui-v2",
+      "x86_64": "target/release/cockatiel-tui-v2"
+    },
+    "macos": {
+      "aarch64": "target/release/cockatiel-tui-v2",
+      "arm": "target/release/cockatiel-tui-v2",
+      "x86": "target/release/cockatiel-tui-v2",
+      "x86_64": "target/release/cockatiel-tui-v2"
+    },
+    "windows": {
+      "aarch64": "target/release/cockatiel-tui-v2.exe",
+      "arm": "target/release/cockatiel-tui-v2.exe",
+      "x86": "target/release/cockatiel-tui-v2.exe",
+      "x86_64": "target/release/cockatiel-tui-v2.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "kind": "tui",
+  "launch_command": "cargo",
+  "name": "tui",
+  "release": {
+    "assets": {
+      "macos": {
+        "aarch64": {
+          "file": "tui-0.1.0-macos-aarch64.tar.gz",
+          "sha256": "94a2087b2b2c90bb6b8d322c99b38a6629944c02d5cfedfd6bc900cbbfd212c7"
+        }
+      }
+    },
+    "base_url": "https://github.com/vulbyte/cockatiel_tui_v2-rs/releases/download",
+    "repo": "vulbyte/cockatiel_tui_v2-rs",
+    "tag": "v0.1.0"
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.1.0"
+}
