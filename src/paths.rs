@@ -74,17 +74,22 @@ fn installed(root: &Path) -> Paths {
     }
 }
 
-/// The legacy monorepo layout: the sibling crates and repo-root chart.
+/// The legacy monorepo layout. `root` is
+/// `<repo>/modules/cockatiel_module-tui_v2-rs`: the repo root is two levels up,
+/// `modules/` is its parent, and the user-database is now a nested submodule of
+/// the engine (`<repo>/cockatiel_engine-rs/modules/cockatiel_user_database-rs`).
 fn legacy(root: &Path) -> Paths {
-    let parent = root.join("..");
+    let modules_dir = root.join("..");
+    let repo = modules_dir.join("..");
+    let engine_dir = repo.join("cockatiel_engine-rs");
     Paths {
         layout: Layout::Legacy,
         root: root.to_path_buf(),
-        engine_dir: parent.join("cockatiel_engine-rs"),
-        user_db_dir: parent.join("cockatiel_user_database-rs"),
+        user_db_dir: engine_dir.join("modules").join("cockatiel_user_database-rs"),
+        engine_dir,
         tui_dir: root.to_path_buf(),
-        modules_dir: parent.join("modules"),
-        rank_chart: parent.join("rank_chart.json"),
+        modules_dir,
+        rank_chart: repo.join("rank_chart.json"),
     }
 }
 
@@ -192,7 +197,7 @@ mod tests {
     #[test]
     fn explicit_install_root_uses_the_installed_layout() {
         let root = Path::new("/opt/cockatiel");
-        let p = resolve(Some(root), None, Path::new("/monorepo/cockatiel_tui_v2-rs"));
+        let p = resolve(Some(root), None, Path::new("/monorepo/modules/cockatiel_module-tui_v2-rs"));
         assert_eq!(p.layout, Layout::Installed);
         assert_eq!(p.root.as_path(), root);
         assert_eq!(p.engine_dir, root.join("engine"));
@@ -207,7 +212,7 @@ mod tests {
         let root = temp_root("ck-paths-exe");
         std::fs::create_dir_all(root.join("engine")).unwrap();
         let exe = root.join("bin").join("cockatiel-tui-v2");
-        let p = resolve(None, Some(&exe), Path::new("/monorepo/cockatiel_tui_v2-rs"));
+        let p = resolve(None, Some(&exe), Path::new("/monorepo/modules/cockatiel_module-tui_v2-rs"));
         assert_eq!(p.layout, Layout::Installed);
         assert_eq!(p.root, root);
         assert_eq!(p.engine_dir, root.join("engine"));
@@ -223,23 +228,26 @@ mod tests {
         // sibling is. Without it the monorepo layout must win.
         let root = temp_root("ck-paths-noeng");
         let exe = root.join("bin").join("cockatiel-tui-v2");
-        let legacy = Path::new("/monorepo/cockatiel_tui_v2-rs");
+        let legacy = Path::new("/monorepo/modules/cockatiel_module-tui_v2-rs");
         let p = resolve(None, Some(&exe), legacy);
         assert_eq!(p.layout, Layout::Legacy);
-        assert_eq!(p.engine_dir, legacy.join("..").join("cockatiel_engine-rs"));
+        assert_eq!(p.engine_dir, legacy.join("..").join("..").join("cockatiel_engine-rs"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn legacy_layout_matches_the_compile_time_paths() {
-        let legacy = Path::new("/monorepo/cockatiel_tui_v2-rs");
+        let legacy = Path::new("/monorepo/modules/cockatiel_module-tui_v2-rs");
         let p = resolve(None, None, legacy);
         assert_eq!(p.layout, Layout::Legacy);
-        assert_eq!(p.engine_dir, legacy.join("..").join("cockatiel_engine-rs"));
-        assert_eq!(p.user_db_dir, legacy.join("..").join("cockatiel_user_database-rs"));
+        assert_eq!(p.engine_dir, legacy.join("..").join("..").join("cockatiel_engine-rs"));
+        assert_eq!(
+            p.user_db_dir,
+            legacy.join("..").join("..").join("cockatiel_engine-rs").join("modules").join("cockatiel_user_database-rs")
+        );
         assert_eq!(p.tui_dir, legacy);
-        assert_eq!(p.modules_dir, legacy.join("..").join("modules"));
-        assert_eq!(p.rank_chart, legacy.join("..").join("rank_chart.json"));
+        assert_eq!(p.modules_dir, legacy.join(".."));
+        assert_eq!(p.rank_chart, legacy.join("..").join("..").join("rank_chart.json"));
     }
 
     #[test]
