@@ -42,7 +42,7 @@ use cockatiel_client::proto::{Prompt, PromptType};
 use cockatiel_client::PromptKind;
 use colors::load_colors;
 use event::AppEvent;
-use hotkeys::{action_label, load_hotkeys, Action};
+use hotkeys::{action_label, load_hotkeys, Action, AdoptMode};
 use ws_client::{WsClient, WsCommand, WsEvent};
 use ws_server::WsServer;
 
@@ -266,29 +266,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Databases are an expected core of the engine — always launch the
-        // user database service first so the engine can connect to it.
-        let user_db_up = std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", supervisor::USER_DB_DEFAULT_PORT).parse().unwrap(),
-            std::time::Duration::from_millis(300),
-        ).is_ok();
-        if !user_db_up {
-            match supervisor::launch_user_db() {
-                Ok(child) => {
-                    let pid = child.id();
-                    supervisor.insert(
-                        "user-database".to_string(),
-                        Arc::new(Mutex::new(supervisor::ManagedProcess {
-                            child,
-                            terminal_window: None,
-                            terminal_pidfile: None,
-                        })),
-                    );
-                    eprintln!("[supervisor] Launched user database (pid {})", pid);
-                }
-                Err(e) => eprintln!("[supervisor] User DB launch failed: {}", e),
-            }
-        }
+        // The user database is provisioned by the RUN LOOP, not here: a fresh
+        // checkout has no compiled user-db binary, so it is built on demand in
+        // the background while the engine (launched below, paused) reports
+        // BLOCKED until the service is reachable. Building it here would either
+        // block the UI or fail silently before the log window exists.
 
         // Ensure the engine is running (launch if not already reachable).
         //
@@ -523,6 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         restart_rx,
         retry_rx,
         launch_rx,
+        detached_window.is_none(),
     ).await;
 
     // Tear down everything the TUI owns before exiting.
@@ -554,6 +537,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A step in the user-database provisioning task's report back to the UI loop.
+enum UserDbProvision {
+    /// A line to surface in the log window (build started / finished).
+    Log(String),
+    /// The binary is ready; the main loop should launch it (it owns the
+    /// ProcessTable so the child is reaped on teardown). Sent again if the
+    /// service dies, so it is supervised, not one-shot.
+    Launch,
+    /// Provisioning failed (build error, spawn error) — surfaced in the log.
+    Failed(String),
+}
+
+/// Ensure the user-database binary exists and keep signalling the UI loop to
+/// launch it while the port is down. A LOOP, not a one-shot: if the service
+/// dies the engine blocks again, so the task must notice and ask for a relaunch.
+///
+/// Runs OFF the UI loop: the first build of a fresh checkout can take minutes,
+/// and the engine reports BLOCKED the whole time (the badge tells the operator
+/// why). `cargo`'s output is CAPTURED, never inherited — a child writing to the
+/// tty while the alternate screen is active would scribble over the UI.
+async fn provision_user_db(tx: mpsc::UnboundedSender<UserDbProvision>) {
+    let mut built = false;
+    loop {
+        let up = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", supervisor::USER_DB_DEFAULT_PORT).parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_ok();
+        if up {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        if !built && crate::paths::user_db_binary().is_none() {
+            built = true;
+            let dir = supervisor::user_db_dir();
+            let _ = tx.send(UserDbProvision::Log(format!(
+                "[supervisor] user database not built — building it now (cargo build --release in {})",
+                dir.display()
+            )));
+            let build_dir = dir.clone();
+            match tokio::task::spawn_blocking(move || build_user_db(&build_dir)).await {
+                Ok(Ok(())) => {
+                    let _ = tx.send(UserDbProvision::Log(
+                        "[supervisor] user database built".to_string(),
+                    ));
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(UserDbProvision::Failed(e));
+                    // Don't hot-loop a broken build; back off and retry.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    built = false;
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.send(UserDbProvision::Failed(format!("build task panicked: {}", e)));
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    built = false;
+                    continue;
+                }
+            }
+        }
+
+        let _ = tx.send(UserDbProvision::Launch);
+        // Give the freshly-spawned service a moment to bind before re-checking;
+        // this also bounds the relaunch rate if it dies immediately.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// Run `cargo build --release` for the user database, capturing its output.
+fn build_user_db(dir: &std::path::Path) -> Result<(), String> {
+    let output = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("could not run cargo build in {}: {}", dir.display(), e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // The last few stderr lines carry the actual compile error.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
+    let tail: Vec<&str> = tail.into_iter().rev().collect();
+    Err(format!(
+        "cargo build --release failed ({}) in {}:\n{}",
+        output.status,
+        dir.display(),
+        tail.join("\n")
+    ))
+}
+
+/// Apply one provisioning event: log it, or launch the service (and register the
+/// child so teardown reaps it).
+fn handle_user_db_provision(
+    ev: UserDbProvision,
+    state: &mut AppState,
+    supervisor: &mut supervisor::ProcessTable,
+) {
+    match ev {
+        UserDbProvision::Log(line) => supervisor_log(state, line),
+        UserDbProvision::Failed(e) => {
+            supervisor_log(state, format!("[supervisor] user database unavailable: {}", e));
+        }
+        UserDbProvision::Launch => {
+            // If a previous child is still running, leave it. If it has EXITED
+            // (a crash), reap it and relaunch — otherwise the engine would stay
+            // BLOCKED forever with a dead service in the table.
+            if let Some(existing) = supervisor.get("user-database").cloned() {
+                let exited = {
+                    let mut proc = existing.lock().unwrap();
+                    matches!(proc.child.try_wait(), Ok(Some(_)))
+                };
+                if exited {
+                    supervisor.remove("user-database");
+                    supervisor_log(state, "[supervisor] user database exited — restarting it");
+                } else {
+                    return;
+                }
+            }
+            match supervisor::launch_user_db() {
+                Ok(child) => {
+                    let pid = child.id();
+                    supervisor.insert(
+                        "user-database".to_string(),
+                        Arc::new(Mutex::new(supervisor::ManagedProcess {
+                            child,
+                            terminal_window: None,
+                            terminal_pidfile: None,
+                        })),
+                    );
+                    supervisor_log(state, format!("[supervisor] launched user database (pid {})", pid));
+                }
+                Err(e) => supervisor_log(state, format!("[supervisor] user database launch failed: {}", e)),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -571,10 +693,24 @@ async fn run_app(
     mut restart_rx: mpsc::UnboundedReceiver<String>,
     mut retry_rx: mpsc::UnboundedReceiver<(String, supervisor::LaunchMode)>,
     mut launch_rx: mpsc::UnboundedReceiver<(String, Result<(String, Vec<String>), String>)>,
+    manage_user_db: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Input events arrive instantly from a background crossterm reader thread.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     event::spawn_event_reader(event_tx);
+
+    // User-database provisioning runs in the background so a first-time build
+    // never freezes the UI; the engine shows BLOCKED until the service is up.
+    // The keepalive sender stays alive for the whole loop so `recv()` pends
+    // (rather than returning None forever and spinning the select) when this is
+    // a detached window that does not own the stack.
+    let (user_db_tx, mut user_db_rx) = mpsc::unbounded_channel::<UserDbProvision>();
+    let _user_db_tx_keepalive = user_db_tx.clone();
+    if manage_user_db {
+        tokio::spawn(async move {
+            provision_user_db(user_db_tx).await;
+        });
+    }
 
     // Fingerprint of the last drawn frame's shape; a change forces a full
     // repaint instead of a diff. `None` until the first frame is drawn.
@@ -756,6 +892,11 @@ async fn run_app(
                         &ws_command_tx,
                     )
                     .await;
+                }
+            }
+            maybe_user_db = user_db_rx.recv() => {
+                if let Some(ev) = maybe_user_db {
+                    handle_user_db_provision(ev, state, supervisor);
                 }
             }
             _ = redraw.tick() => {
@@ -1239,6 +1380,64 @@ async fn handle_input_event(
                         return Ok(false);
                     }
                 }
+            }
+
+            // A window in add-module browser mode consumes every key (the
+            // browser owns the whole interaction until Esc). Resolve the action
+            // inside the window borrow, then dispatch it outside.
+            let (in_browser, browser_action) = match state.get_window_mut(state.active_window) {
+                Some(w) if w.in_browser() => (true, w.browser_key(key, &hotkeys)),
+                _ => (false, None),
+            };
+            if in_browser {
+                // The browser resolves either `AdoptModule` (an action) or
+                // `Noop` (a consumed key); nothing else. Dispatch the former.
+                if let Some(Action::AdoptModule(dir, mode)) = browser_action {
+                    if dispatch_action(
+                        state,
+                        Action::AdoptModule(dir, mode),
+                        supervisor,
+                        plugins,
+                        port,
+                        pin,
+                        ws_command_tx,
+                        ws_addr,
+                        ws_auth_token,
+                    )
+                    .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+
+            // A window with a modal confirmation dialog open consumes every key
+            // (like the browser above). Resolve the action inside the window
+            // borrow, then dispatch it outside.
+            let (in_dialog, dialog_action) = match state.get_window_mut(state.active_window) {
+                Some(w) if w.in_dialog() => (true, w.dialog_key(key)),
+                _ => (false, None),
+            };
+            if in_dialog {
+                if let Some(action) = dialog_action {
+                    if dispatch_action(
+                        state,
+                        action,
+                        supervisor,
+                        plugins,
+                        port,
+                        pin,
+                        ws_command_tx,
+                        ws_addr,
+                        ws_auth_token,
+                    )
+                    .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
             }
 
             // The F1 accessibility help modal: ESC is the safe route out.
@@ -1896,6 +2095,8 @@ fn is_dispatchable(action: &Action) -> bool {
             | Action::StopModule(_)
             | Action::DeleteModule(_)
             | Action::ToggleAutostart(_)
+            | Action::EditModulePrice(_)
+            | Action::EditModuleRank(_)
             | Action::DuplicateModule(_)
             | Action::EditCredentials(_)
             | Action::EditConfig(_)
@@ -1912,6 +2113,8 @@ fn is_dispatchable(action: &Action) -> bool {
             | Action::SplitHorizontal
             | Action::JoinPanes
             | Action::WindowToggle
+            | Action::OpenModuleBrowser
+            | Action::AdoptModule(_, _)
     )
 }
 
@@ -1937,12 +2140,41 @@ fn is_module_scoped(action: &Action) -> bool {
         action,
         Action::DeleteModule(_)
             | Action::ToggleAutostart(_)
+            | Action::EditModulePrice(_)
+            | Action::EditModuleRank(_)
             | Action::DuplicateModule(_)
             | Action::ClearModuleConfig(_)
             | Action::EditCredentials(_)
             | Action::RunTests
             | Action::MoveModuleStage(_, _)
     )
+}
+
+/// Write `field = value` into the module's `cockatiel_module_info.json` (the
+/// manifest the engine reads the module's gates from). Returns true when the
+/// file was written. The in-memory view is updated by the caller, because the
+/// value's shape differs per field.
+fn write_manifest_field(
+    plugins: &[crate::plugins::Plugin],
+    name: &str,
+    field: &str,
+    value: serde_json::Value,
+) -> bool {
+    let Some(plugin) = plugins.iter().find(|p| p.manifest.name.as_str() == name) else {
+        return false;
+    };
+    let manifest_path = plugin.directory.join(crate::plugins::MANIFEST_FILENAME);
+    let Ok(data) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return false;
+    };
+    manifest[field] = value;
+    let Ok(pretty) = serde_json::to_string_pretty(&manifest) else {
+        return false;
+    };
+    std::fs::write(&manifest_path, pretty).is_ok()
 }
 
 /// Whether the focused window's selection is a module, i.e. whether a
@@ -2005,6 +2237,8 @@ fn fill_window_action(state: &AppState, window_name: &str, action: Action) -> Ac
         Action::StopModule(_) => Action::StopModule(name),
         Action::DeleteModule(_) => Action::DeleteModule(name),
         Action::ToggleAutostart(_) => Action::ToggleAutostart(name),
+        Action::EditModulePrice(_) => Action::EditModulePrice(name),
+        Action::EditModuleRank(_) => Action::EditModuleRank(name),
         Action::DuplicateModule(_) => Action::DuplicateModule(name),
         Action::EditCredentials(_) => Action::EditCredentials(name),
         Action::EditConfig(_) => Action::EditConfig(name),
@@ -2060,6 +2294,81 @@ fn sync_module_runs(state: &mut AppState) {
             }
         }
     }
+}
+
+/// Adopt a module selected in the add-module browser: place the folder (move or
+/// link when it lives outside the standard modules directory), register it as
+/// trusted + started, add it to the engine ordering, and launch it. The engine
+/// approves the connect and routes it.
+fn adopt_module(
+    state: &mut AppState,
+    dir: &std::path::Path,
+    mode: AdoptMode,
+    supervisor: &mut supervisor::ProcessTable,
+    plugins: &mut Vec<crate::plugins::Plugin>,
+    port: u16,
+    pin: u32,
+) {
+    // Validate + name the module from its manifest. Quiet: a failure is logged
+    // through the log window, not printed over the live UI.
+    let Some(plugin) = crate::plugins::load_plugin_quiet(dir) else {
+        supervisor_log(
+            state,
+            format!(
+                "[supervisor] {} has no valid {} — not added",
+                dir.display(),
+                crate::plugins::MANIFEST_FILENAME
+            ),
+        );
+        return;
+    };
+    let name = plugin.manifest.name.clone();
+
+    // Place the folder.
+    let placed = match mode {
+        AdoptMode::InPlace => Ok(dir.to_path_buf()),
+        AdoptMode::Move => crate::supervisor::move_module_into_standard_dir(dir, &name),
+        AdoptMode::Link => crate::supervisor::link_module_into_standard_dir(dir, &name),
+    };
+    let module_dir = match placed {
+        Ok(p) => p,
+        Err(e) => {
+            supervisor_log(state, format!("[supervisor] could not add '{}': {}", name, e));
+            return;
+        }
+    };
+
+    // Re-load from the final location (a move changes the path; a symlink adds
+    // one), so the plugin's directory is the one the engine crawl will see.
+    let Some(plugin) = crate::plugins::load_plugin_quiet(&module_dir) else {
+        supervisor_log(
+            state,
+            format!("[supervisor] {} did not load after placement — not added", module_dir.display()),
+        );
+        return;
+    };
+    let name = plugin.manifest.name.clone();
+    let position = plugin.manifest.capabilities.clone();
+
+    // Replace any stale runtime entry for the same name so the launch resolves
+    // the new directory.
+    plugins.retain(|p| p.manifest.name != name);
+    plugins.push(plugin);
+
+    // Trusted: the engine approves its connect without a prompt. It is launched
+    // below, and will autostart on later launches if its manifest says so.
+    crate::supervisor::register_adopted(&name, &position, 100);
+    crate::supervisor::add_to_ordering(&name, &position, 100);
+
+    if supervisor.contains_key(&name) {
+        supervisor_log(state, format!("[supervisor] module '{}' re-added (already running)", name));
+        return;
+    }
+    request_launch(state, &name, supervisor, plugins, port, pin, supervisor::LaunchMode::Prebuilt);
+    supervisor_log(
+        state,
+        format!("[supervisor] added module '{}' from {} — launching", name, module_dir.display()),
+    );
 }
 
 /// Request a module launch: resolve the launch command (building if needed) on
@@ -2132,6 +2441,10 @@ fn autostart_module_names(plugins: &[crate::plugins::Plugin]) -> Vec<String> {
 /// manifest has `autostart: true`, then resume the pipeline (the engine boots
 /// paused, so without this nothing would dispatch until the operator pressed
 /// `p`). Fires exactly once per TUI session.
+///
+/// The manifest's `autostart` flag is the ONLY gate: a module marked autostart
+/// launches on a fresh start, whether or not it has ever run before. There is
+/// no separate "has the operator started it once" state to keep in sync.
 async fn auto_start_once(
     state: &mut AppState,
     supervisor: &mut supervisor::ProcessTable,
@@ -2140,7 +2453,7 @@ async fn auto_start_once(
     pin: u32,
     ws_command_tx: &mpsc::UnboundedSender<WsCommand>,
 ) {
-    let autostart = autostart_module_names(plugins);
+    let autostart: Vec<String> = autostart_module_names(plugins);
     if !autostart.is_empty() {
         supervisor_log(
             state,
@@ -2740,6 +3053,25 @@ async fn dispatch_action(
             state.force_full_redraw = true;
             return Ok(false);
         }
+        Action::OpenModuleBrowser => {
+            // The browser lives in the modules window; open it there at the
+            // configured modules directory.
+            let start = crate::supervisor::modules_dir();
+            if let Some(w) = state.get_window_mut(WindowId::Modules) {
+                w.open_module_browser(start);
+                state.force_full_redraw = true;
+            } else {
+                crate::app::supervisor_log_global(
+                    "add module: the modules window is not mounted".to_string(),
+                );
+            }
+            return Ok(false);
+        }
+        Action::AdoptModule(dir, mode) => {
+            adopt_module(state, &dir, mode, supervisor, plugins, port, pin);
+            state.force_full_redraw = true;
+            return Ok(false);
+        }
         Action::PopOut(window_name) => {
             state.popped_out.insert(window_name.clone());
             let exe = std::env::current_exe().unwrap_or_default();
@@ -2920,37 +3252,112 @@ async fn dispatch_action(
             supervisor_log(state, format!("[supervisor] delete requested for {} — awaiting confirmation", name));
         }
         Action::ToggleAutostart(name) => {
-            // Flip autostart in the plugin's manifest file directly, AND in the
+            // `a` OPENS A CONFIRMATION DIALOG rather than writing immediately,
+            // so the operator sees exactly what it is about to change (and a new
+            // operator learns what autostart means). The dialog resolves to
+            // `SetAutostart` on confirm; the write lives there.
+            let current = state
+                .stats
+                .module_entries
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.autostart)
+                .unwrap_or(false);
+            if let Some(window) = state.get_window_mut(WindowId::Modules) {
+                window.open_autostart_dialog(name, current);
+            }
+        }
+        Action::SetAutostart(name, enable) => {
+            // Write the chosen value to the module's manifest file AND the
             // in-memory view so the `A` marker updates immediately (the engine's
             // module_list only reports the manifest value on the next poll, and
-            // even then it reflects a rediscovery, so the toggle would otherwise
+            // even then it reflects a rediscovery, so the change would otherwise
             // look like it did nothing on screen).
-            let mut flipped = false;
+            let mut wrote = false;
             if let Some(plugin) = plugins.iter().find(|p| p.manifest.name == name) {
                 let manifest_path = plugin.directory.join(crate::plugins::MANIFEST_FILENAME);
                 if let Ok(data) = std::fs::read_to_string(&manifest_path) {
                     if let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(&data) {
-                        let cur = manifest.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let next = !cur;
-                        manifest["autostart"] = serde_json::json!(next);
+                        manifest["autostart"] = serde_json::json!(enable);
                         if let Ok(pretty) = serde_json::to_string_pretty(&manifest) {
                             let _ = std::fs::write(&manifest_path, pretty);
-                            flipped = true;
+                            wrote = true;
                         }
-                        // Reflect the new state in the in-memory view NOW so the
-                        // rendered `A` marker tracks the press.
                         for m in &mut state.stats.module_entries {
                             if m.name == name {
-                                m.autostart = next;
+                                m.autostart = enable;
                             }
                         }
                     }
                 }
             }
-            if flipped {
+            if wrote {
                 supervisor_log(
                     state,
-                    format!("[supervisor] {} autostart toggled", name),
+                    format!(
+                        "[supervisor] {} autostart {}",
+                        name,
+                        if enable { "enabled" } else { "disabled" }
+                    ),
+                );
+            }
+        }
+        Action::EditModulePrice(name) => {
+            // `c`: open a text editor for the module's price (points). The
+            // editor resolves to `SetModulePrice`.
+            let current = state
+                .stats
+                .module_entries
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.price.to_string())
+                .unwrap_or_default();
+            if let Some(window) = state.get_window_mut(WindowId::Modules) {
+                window.open_price_dialog(name, current);
+            }
+        }
+        Action::EditModuleRank(name) => {
+            // `r`: open a text editor for the module's minimum rank (0-1). The
+            // editor resolves to `SetModuleRank`.
+            let current = state
+                .stats
+                .module_entries
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| format!("{:.2}", m.min_rank))
+                .unwrap_or_default();
+            if let Some(window) = state.get_window_mut(WindowId::Modules) {
+                window.open_rank_dialog(name, current);
+            }
+        }
+        Action::SetModulePrice(name, value) => {
+            // Empty input = free (0). The editor only feeds digits, but parse
+            // defensively anyway.
+            let price: u32 = value.trim().parse().unwrap_or(0);
+            let wrote = write_manifest_field(plugins, &name, "price", serde_json::json!(price));
+            for m in &mut state.stats.module_entries {
+                if m.name == name {
+                    m.price = price;
+                }
+            }
+            if wrote {
+                supervisor_log(state, format!("[supervisor] {} cost set to {}p", name, price));
+            }
+        }
+        Action::SetModuleRank(name, value) => {
+            // The gate is a 0-1 number; clamp so a typo can never store a value
+            // outside the range the engine compares against.
+            let rank: f32 = value.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+            let wrote = write_manifest_field(plugins, &name, "min_rank", serde_json::json!(rank));
+            for m in &mut state.stats.module_entries {
+                if m.name == name {
+                    m.min_rank = rank;
+                }
+            }
+            if wrote {
+                supervisor_log(
+                    state,
+                    format!("[supervisor] {} rank gate set to {:.2}", name, rank),
                 );
             }
         }
@@ -3096,6 +3503,14 @@ async fn dispatch_action(
                 supervisor_log(state, "[supervisor] cannot toggle the pipeline pause — engine disconnected");
                 return Ok(false);
             }
+            // ALWAYS send the toggle; the ENGINE is the authority on whether it
+            // can open the gate. It used to short-circuit here when the TUI's
+            // cached `blocked_reason` was set — but that cache can be stale (a
+            // dropped `db_status` after the dependency recovered leaves it stuck
+            // on Some), and then `p` silently did nothing forever. The engine's
+            // `pipeline_set_paused` already handles the blocked case: it records
+            // a deferred resume and answers with the block still set, which the
+            // response updates the UI from.
             send_engine_query(
                 ws_command_tx,
                 "pipeline_set_paused".to_string(),
@@ -3735,6 +4150,7 @@ mod tests {
 
                     authority: 0,
                     price: 0,
+                    min_rank: 0.0,
                 })
                 .collect();
             s
@@ -3880,6 +4296,7 @@ mod tests {
 
                 authority: 0,
                 price: 0,
+                min_rank: 0.0,
             }];
 
             // Filled in by `fill_window_action` for a real keypress. With the
@@ -4186,6 +4603,7 @@ mod engine_lifecycle_tests {
 
             authority: 0,
             price: 0,
+            min_rank: 0.0,
         }];
         s.stats.connection = db::ConnectionInfo { ip: "127.0.0.1".into(), port: 9734, pin: 4242 };
         s
@@ -5082,10 +5500,17 @@ mod engine_lifecycle_tests {
                 block
             );
         }
-        // And the user database is launched BEFORE the gate, unconditionally,
-        // on the way to it.
-        let db_at = src.find("supervisor::launch_user_db()").expect("the user database launch");
-        assert!(db_at < start, "the user database is not behind the engine gate");
+        // The user database is provisioned by the RUN LOOP (build-on-demand +
+        // launch), never behind the engine gate: the launch moved out of main()'s
+        // setup into `handle_user_db_provision`, so the gate cannot reach it.
+        assert!(
+            src.contains("fn provision_user_db("),
+            "the user database is provisioned by the run loop"
+        );
+        assert!(
+            src.contains("fn handle_user_db_provision("),
+            "the run loop launches the user database"
+        );
         // The gate is the decision function, not a bare boolean: a later edit
         // cannot quietly drop the "already running" half of the condition.
         assert!(src.contains("engine_start_decision(engine_up, should_launch)"));

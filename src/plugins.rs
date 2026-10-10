@@ -287,7 +287,19 @@ fn walk(dir: &Path, out: &mut Vec<Plugin>) {
     }
 }
 
-fn load_plugin(dir: &Path) -> Option<Plugin> {
+pub fn load_plugin(dir: &Path) -> Option<Plugin> {
+    load_plugin_impl(dir, true)
+}
+
+/// Like [`load_plugin`] but SILENT on an invalid manifest. The add-module
+/// browser runs inside the live TUI, where a stray `eprintln!` would scribble
+/// over the ratatui screen; callers there report failures through the log
+/// window instead.
+pub fn load_plugin_quiet(dir: &Path) -> Option<Plugin> {
+    load_plugin_impl(dir, false)
+}
+
+fn load_plugin_impl(dir: &Path, verbose: bool) -> Option<Plugin> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
     let contents = std::fs::read_to_string(&manifest_path).ok()?;
     let manifest: ModuleManifest = serde_json::from_str(&contents).ok()?;
@@ -298,11 +310,13 @@ fn load_plugin(dir: &Path) -> Option<Plugin> {
         return None;
     }
     if !is_valid_module_name(&manifest.name) {
-        eprintln!(
-            "[plugins] skipping {}: invalid module name {:?} — must match ^[A-Za-z0-9_-]+$ (no spaces, shell metacharacters, path separators, or '.'/'..')",
-            dir.display(),
-            manifest.name
-        );
+        if verbose {
+            eprintln!(
+                "[plugins] skipping {}: invalid module name {:?} — must match ^[A-Za-z0-9_-]+$ (no spaces, shell metacharacters, path separators, or '.'/'..')",
+                dir.display(),
+                manifest.name
+            );
+        }
         return None;
     }
     Some(Plugin {

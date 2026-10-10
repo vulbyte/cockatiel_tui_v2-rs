@@ -4,6 +4,7 @@ pub mod modules;
 pub mod chart;
 pub mod prompts;
 pub mod users;
+pub mod stream_manager;
 pub mod hotkey_wrap;
 
 pub use logo::LogoWindow;
@@ -12,3 +13,4 @@ pub use modules::ModulesWindow;
 pub use chart::ChartWindow;
 pub use prompts::PromptsWindow;
 pub use users::UsersWindow;
+pub use stream_manager::StreamManagerWindow;

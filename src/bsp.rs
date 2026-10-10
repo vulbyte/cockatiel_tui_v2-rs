@@ -46,6 +46,7 @@ pub enum ViewType {
     EngineGraph,
     Prompts,
     TopUsers,
+    StreamManager,
 }
 
 impl ViewType {
@@ -57,6 +58,7 @@ impl ViewType {
             ViewType::EngineGraph,
             ViewType::Prompts,
             ViewType::TopUsers,
+            ViewType::StreamManager,
         ]
     }
 
@@ -68,6 +70,7 @@ impl ViewType {
             ViewType::EngineGraph => "engine_graph",
             ViewType::Prompts => "prompts",
             ViewType::TopUsers => "top_users",
+            ViewType::StreamManager => "stream_manager",
         }
     }
 
@@ -84,6 +87,7 @@ impl ViewType {
             ViewType::EngineGraph => WindowId::Chart,
             ViewType::Prompts => WindowId::Prompts,
             ViewType::TopUsers => WindowId::Users,
+            ViewType::StreamManager => WindowId::StreamManager,
         }
     }
 }
@@ -323,7 +327,10 @@ fn split(axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node>) -> Box<Node> {
 
 /// Build a window for a view type. The existing six window impls are reused.
 pub fn make_window(view: ViewType) -> Box<dyn Window> {
-    use crate::windows::{ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, UsersWindow};
+    use crate::windows::{
+        ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, StreamManagerWindow,
+        UsersWindow,
+    };
     match view {
         ViewType::CockatielInfo => Box::new(LogoWindow),
         ViewType::Logs => Box::new(LogWindow::new()),
@@ -331,6 +338,7 @@ pub fn make_window(view: ViewType) -> Box<dyn Window> {
         ViewType::EngineGraph => Box::new(ChartWindow::new()),
         ViewType::Prompts => Box::new(PromptsWindow::new()),
         ViewType::TopUsers => Box::new(UsersWindow::new()),
+        ViewType::StreamManager => Box::new(StreamManagerWindow::new()),
     }
 }
 
@@ -695,24 +703,47 @@ impl LayoutTree {
     }
 
     /// Update a split drag from mouse movement. The drag target is stored in
-    /// `self.dragging`; movement magnitude is scaled by the split's extent.
+    /// `self.dragging`; the movement is converted to a ratio delta against the
+    /// split's OWN extent so the divider tracks the cursor 1:1.
     pub fn update_split_drag(&mut self, x: u16, y: u16) {
         let Some((path, dir)) = self.dragging.clone() else { return };
         let (start_x, start_y) = self.drag_start.unwrap_or((x, y));
+        // The ratio is a FRACTION of the split's extent, so moving the cursor by
+        // one cell must move the divider by one cell: `delta = pixels / extent`.
+        // A fixed divisor (the old `/ 200.0`) made the divider move at a
+        // size-dependent fraction of the cursor speed — sluggish on a narrow
+        // pane, over-sensitive on a wide one — which is the "drag doesn't follow
+        // the mouse" feel. Falls back to the axis only when the split's rect is
+        // not yet known (before the first `compute`).
+        let Some(extent) = self.split_extent(&path) else { return };
+        if extent == 0 {
+            return;
+        }
         // Dragging a divider right or down ALWAYS grows child_a (the left/top
         // pane), regardless of which side of the divider the cursor grabbed.
         let delta = match dir {
             DragDir::Left | DragDir::Right => {
-                let dx = i32::from(x) - i32::from(start_x);
-                dx as f32 / 200.0
+                (i32::from(x) - i32::from(start_x)) as f32 / extent as f32
             }
             DragDir::Top | DragDir::Bottom => {
-                let dy = i32::from(y) - i32::from(start_y);
-                dy as f32 / 200.0
+                (i32::from(y) - i32::from(start_y)) as f32 / extent as f32
             }
         };
         let _ = self.resize_split(&path, delta);
         self.drag_start = Some((x, y));
+    }
+
+    /// The split's extent along its drag axis: width for a left/right split,
+    /// height for a top/bottom split. This is the denominator that turns a
+    /// cursor delta into a ratio delta. `None` when `path` is not a split.
+    fn split_extent(&self, path: &[usize]) -> Option<u16> {
+        match leaf_at(&self.root, path) {
+            Node::Split(s) => Some(match s.axis {
+                Axis::Horizontal => s.rect.width,
+                Axis::Vertical => s.rect.height,
+            }),
+            Node::Leaf(_) => None,
+        }
     }
 
     /// Move focus to the next leaf in tree order (used by Tab / FocusNext).
@@ -1094,6 +1125,49 @@ mod tests {
         t.drag_start = Some((36, 20));
         t.update_split_drag(60, 20);
         assert!(t.split_at(&[]).map(|(_, r)| r).unwrap() > 0.30, "dragging right grew child_a");
+    }
+
+    #[test]
+    fn a_divider_drag_tracks_the_cursor_one_to_one() {
+        // Dragging a divider by N cells must move it by exactly N cells, on any
+        // terminal size. The old fixed `/ 200.0` divisor moved it by
+        // `extent * N / 200` — sluggish on a narrow pane, over-sensitive on a
+        // wide one — which is the "the drag doesn't follow the mouse" feel.
+        for size in [40u16, 120, 300] {
+            // Root is a HORIZONTAL (left/right) split at ratio 0.30.
+            let mut t = tree_3();
+            t.compute(Rect { x: 0, y: 0, width: size, height: 40 });
+            let root = Vec::<usize>::new();
+            let (_, ratio0) = t.split_at(&root).unwrap();
+            let start = (ratio0 * size as f32) as u16;
+            let target = start + size / 4;
+            t.dragging = Some((root.clone(), DragDir::Right));
+            t.drag_start = Some((start, 20));
+            t.update_split_drag(target, 20);
+            let (_, ratio1) = t.split_at(&root).unwrap();
+            let landed = (ratio1 * size as f32).round() as i32;
+            assert!(
+                (landed - i32::from(target)).abs() <= 1,
+                "h size={size}: divider landed at {landed}, cursor at {target}"
+            );
+
+            // The left column is a VERTICAL (top/bottom) split at ratio 0.50.
+            let mut t = tree_3();
+            t.compute(Rect { x: 0, y: 0, width: size, height: 40 });
+            let left = vec![0usize];
+            let (_, ratio0) = t.split_at(&left).unwrap();
+            let start = (ratio0 * 40.0) as u16;
+            let target = start + 10;
+            t.dragging = Some((left.clone(), DragDir::Bottom));
+            t.drag_start = Some((5, start));
+            t.update_split_drag(5, target);
+            let (_, ratio1) = t.split_at(&left).unwrap();
+            let landed = (ratio1 * 40.0).round() as i32;
+            assert!(
+                (landed - i32::from(target)).abs() <= 1,
+                "v size={size}: divider landed at {landed}, cursor at {target}"
+            );
+        }
     }
 
     #[test]

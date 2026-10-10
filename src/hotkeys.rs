@@ -20,7 +20,22 @@ pub enum Action {
     StartModule(String),
     StopModule(String),
     DeleteModule(String),
+    /// The `a` key: open the autostart CONFIRMATION dialog for the selected
+    /// module (the dialog resolves to [`Action::SetAutostart`]).
     ToggleAutostart(String),
+    /// Write the module's autostart flag to `value`. Produced by the autostart
+    /// confirmation dialog — never bound to a key directly.
+    SetAutostart(String, bool),
+    /// The `c` key: open the cost (points) editor for the selected module.
+    EditModulePrice(String),
+    /// The `r` key: open the minimum-rank (0-1) editor for the selected module.
+    EditModuleRank(String),
+    /// Write the module's price to `value` (parsed). Produced by the cost
+    /// editor dialog — never bound to a key directly.
+    SetModulePrice(String, String),
+    /// Write the module's minimum rank (0-1) to `value` (parsed). Produced by
+    /// the rank editor dialog — never bound to a key directly.
+    SetModuleRank(String, String),
     /// Duplicate the selected module under a NEW module name (the engine gives
     /// it a fresh instance UUID) and launch it as its own process — a second,
     /// independent instance sharing the original's binary + config.
@@ -91,7 +106,31 @@ pub enum Action {
     /// — switch what window a pane shows). Same action as clicking the `[v]`
     /// header or pressing Ctrl+T.
     WindowToggle,
+    /// Open the add-module folder browser in the modules window (`n`). The
+    /// window owns the browser state; the dispatcher only opens it at the
+    /// configured modules directory.
+    OpenModuleBrowser,
+    /// Adopt the module whose manifest lives in the carried directory, then
+    /// launch it. `AdoptMode` says how a module that lives OUTSIDE the standard
+    /// modules directory is brought in (the browser resolves the user's choice
+    /// before emitting this).
+    AdoptModule(std::path::PathBuf, AdoptMode),
     Noop,
+}
+
+/// How an adopted module folder is placed relative to the standard modules
+/// directory. Chosen by the operator in the browser's confirm/relink step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdoptMode {
+    /// The folder is already inside the standard modules directory; use it as
+    /// is.
+    InPlace,
+    /// Move the folder into the standard directory, deleting the original so no
+    /// stale copy is left behind.
+    Move,
+    /// Symlink the folder into the standard directory, leaving the original in
+    /// place.
+    Link,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +234,8 @@ fn parse_action(s: &str) -> Action {
         "StopModule" => Action::StopModule(String::new()),
         "DeleteModule" => Action::DeleteModule(String::new()),
         "ToggleAutostart" => Action::ToggleAutostart(String::new()),
+        "EditModulePrice" => Action::EditModulePrice(String::new()),
+        "EditModuleRank" => Action::EditModuleRank(String::new()),
         "DuplicateModule" => Action::DuplicateModule(String::new()),
         "AddNote" => Action::AddNote,
         "ShowInfo" => Action::ShowInfo,
@@ -220,6 +261,7 @@ fn parse_action(s: &str) -> Action {
         "JoinPanes" => Action::JoinPanes,
         "OpenUsers" => Action::OpenUsers,
         "WindowToggle" => Action::WindowToggle,
+        "OpenModuleBrowser" => Action::OpenModuleBrowser,
         _ => Action::Noop,
     }
 }
@@ -297,6 +339,11 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::StopModule(_) => "stop",
         Action::DeleteModule(_) => "del",
         Action::ToggleAutostart(_) => "auto",
+        Action::SetAutostart(_, _) => "autostart",
+        Action::EditModulePrice(_) => "cost",
+        Action::EditModuleRank(_) => "rank",
+        Action::SetModulePrice(_, _) => "set-cost",
+        Action::SetModuleRank(_, _) => "set-rank",
         Action::DuplicateModule(_) => "copy",
         Action::EditCredentials(_) => "creds",
         Action::EditConfig(_) => "edit",
@@ -322,6 +369,8 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::JoinPanes => "join",
         Action::WindowToggle => "window-toggle",
         Action::OpenUsers => "users",
+        Action::OpenModuleBrowser => "new-module",
+        Action::AdoptModule(_, _) => "add",
         Action::Quit => "quit",
         Action::FocusNext => "window-next",
         Action::FocusPrev => "window-prev",
@@ -574,7 +623,11 @@ pub fn default_hotkeys() -> HotkeyConfig {
     module_actions.insert(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()), Action::StopModule(String::new()));
     module_actions.insert(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()), Action::DeleteModule(String::new()));
     module_actions.insert(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()), Action::ToggleAutostart(String::new()));
-    module_actions.insert(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()), Action::DuplicateModule(String::new()));
+    // `c` opens the cost (points) editor and `r` the minimum-rank (0-1) editor.
+    // Duplicate moved off `c` (it now owns the cost editor) to `y`.
+    module_actions.insert(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()), Action::EditModulePrice(String::new()));
+    module_actions.insert(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()), Action::EditModuleRank(String::new()));
+    module_actions.insert(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()), Action::DuplicateModule(String::new()));
     module_actions.insert(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()), Action::ClearModuleConfig(String::new()));
     module_actions.insert(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT), Action::EditCredentials(String::new()));
     module_actions.insert(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()), Action::EditConfig(String::new()));
@@ -595,6 +648,9 @@ pub fn default_hotkeys() -> HotkeyConfig {
     module_actions.insert(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT), Action::RemoveEngine);
     module_actions.insert(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()), Action::RunTests);
     module_actions.insert(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()), Action::OpenUsers);
+    // `n` opens the add-module folder browser ("new module"). Lowercase, in the
+    // module-action cluster, and unbound elsewhere in this window.
+    module_actions.insert(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()), Action::OpenModuleBrowser);
 
     let mut chart_actions = HashMap::new();
     chart_actions.insert(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()), Action::TimeWindow5m);

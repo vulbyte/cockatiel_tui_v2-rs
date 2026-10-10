@@ -47,6 +47,9 @@ pub enum WindowId {
     /// Detached pop-out user database view. NOT part of the embedded window
     /// cycle (`all()`), so it never joins the focus rotation.
     Users,
+    /// Stream manager: schedule/update a stream's title, start time and
+    /// thumbnail. Writes `stream_control`; the adapters poll `stream_schedule`.
+    StreamManager,
 }
 
 impl WindowId {
@@ -58,6 +61,7 @@ impl WindowId {
             WindowId::Chart => "chart",
             WindowId::Prompts => "prompts",
             WindowId::Users => "users",
+            WindowId::StreamManager => "stream_manager",
         }
     }
 
@@ -69,6 +73,7 @@ impl WindowId {
             WindowId::Chart => "message chart",
             WindowId::Prompts => "prompts",
             WindowId::Users => "user database",
+            WindowId::StreamManager => "stream manager",
         }
     }
 }
@@ -164,6 +169,31 @@ pub trait Window {
     fn editor_key(&mut self, _key: KeyEvent, _hotkeys: &HotkeyConfig) -> bool { false }
     /// Paste text into the active config editor (at the cursor). Consumed?
     fn editor_paste(&mut self, _text: &str) -> bool { false }
+    /// True when the window's add-module folder browser is active (it consumes
+    /// all keys, like the config editor).
+    fn in_browser(&self) -> bool { false }
+    /// Handle a key while the add-module browser is active. Returns the action
+    /// the browser resolved (e.g. `AdoptModule`), or `Some(Action::Noop)` when
+    /// the key was consumed without resolving anything. `None` when no browser
+    /// is open.
+    fn browser_key(&mut self, _key: KeyEvent, _hotkeys: &HotkeyConfig) -> Option<Action> { None }
+    /// Open the add-module folder browser, starting at `start`.
+    fn open_module_browser(&mut self, _start: std::path::PathBuf) {}
+    /// True when the window has a modal confirmation dialog open (it consumes
+    /// every key, like the config editor and the add-module browser).
+    fn in_dialog(&self) -> bool { false }
+    /// Handle a key while a modal dialog is open. Returns the action the dialog
+    /// resolved (e.g. `SetAutostart`), or `Some(Action::Noop)` when the key was
+    /// consumed without resolving anything. `None` when no dialog is open.
+    fn dialog_key(&mut self, _key: KeyEvent) -> Option<Action> { None }
+    /// Open the autostart confirmation dialog for `module`, targeting the
+    /// opposite of its current (`current`) state. Only the modules window
+    /// implements it.
+    fn open_autostart_dialog(&mut self, _module: String, _current: bool) {}
+    /// Open the cost (points) editor for `module`, prefilled with `current`.
+    fn open_price_dialog(&mut self, _module: String, _current: String) {}
+    /// Open the minimum-rank (0-1) editor for `module`, prefilled with `current`.
+    fn open_rank_dialog(&mut self, _module: String, _current: String) {}
     /// The module whose config the editor most recently saved, if any (cleared
     /// when read). Lets the app warn that the module must be restarted.
     fn take_saved_module(&mut self) -> Option<String> { None }
@@ -454,7 +484,10 @@ impl AppState {
             prompts_width_pct: self.layout.prompts_width_pct,
             window_count: self.tree.leaf_order().len(),
             active: self.active_window,
-            editing: self.tree.any_window(|w| w.in_editor()),
+            // The config editor AND the add-module browser both take over a
+            // window with variable-height content; treating either as a shape
+            // change forces a clean repaint when it opens or closes.
+            editing: self.tree.any_window(|w| w.in_editor() || w.in_browser()),
             prompting: self.credential_session.is_some(),
             prompt_count: self.pending_prompt.len(),
         }

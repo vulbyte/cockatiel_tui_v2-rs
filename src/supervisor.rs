@@ -635,9 +635,32 @@ pub fn read_engine_addr() -> Option<(u16, u32)> {
     Some((port, pin))
 }
 
-/// Default user-database backup path (sibling of the live DB file).
+/// The user's home directory from the environment (`$HOME` / `%USERPROFILE%`).
+fn home_dir() -> Option<PathBuf> {
+    let non_empty = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+    non_empty("HOME")
+        .or_else(|| non_empty("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// The default backup directory for both databases: `<home>/.cockatiel/backups`.
+/// OUTSIDE the working folder, so a deleted/moved folder cannot take the only
+/// backup with it. Falls back to `./.cockatiel/backups` when home is unknown.
+pub fn default_backup_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cockatiel")
+        .join("backups")
+}
+
+/// The user-database backup path. An explicit `USER_DB_BACKUP_PATH` in the
+/// user-db's own `.env` wins (the operator can point the backup anywhere);
+/// otherwise it defaults to the home directory (see [`default_backup_dir`]).
 pub fn user_db_backup_path() -> PathBuf {
-    user_db_dir().join("user_data_backup.db")
+    read_env_value(&user_db_env_path(), "USER_DB_BACKUP_PATH")
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_backup_dir().join("user_data_backup.db"))
 }
 
 /// Launch the engine as a child process (owned by the TUI).
@@ -2224,6 +2247,169 @@ pub fn register_module_approved(name: &str, position: &str, priority: i32) {
     }
 }
 
+/// Register a module the operator explicitly adopted through the add-module
+/// browser: trusted (`auto_auth: true`) so the engine approves its connect
+/// without a fresh prompt. Adopting it also launches it immediately.
+pub fn register_adopted(name: &str, position: &str, priority: i32) {
+    register_adopted_at(&modules_registry_path(), name, position, priority);
+}
+
+fn register_adopted_at(path: &Path, name: &str, position: &str, priority: i32) {
+    let mut registry: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+
+    if let Some(existing) = registry.iter_mut().find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name)) {
+        existing["position"] = serde_json::json!(position);
+        existing["priority"] = serde_json::json!(priority);
+        existing["auto_auth"] = serde_json::json!(true);
+    } else {
+        registry.push(serde_json::json!({
+            "name": name,
+            "instance_uuid7": uuid::Uuid::now_v7().to_string(),
+            "position": position,
+            "priority": priority,
+            "auto_auth": true,
+            "auth_token": ""
+        }));
+    }
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&registry) {
+        let _ = write_atomic_0600(path, &pretty);
+    }
+}
+
+/// Whether `name` already has an entry in `modules.json` (known to the engine,
+/// regardless of whether it is currently running).
+pub fn is_registered(name: &str) -> bool {
+    is_registered_at(&modules_registry_path(), name)
+}
+
+fn is_registered_at(path: &Path, name: &str) -> bool {
+    let registry: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+    registry
+        .iter()
+        .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Whether `dir` is inside the configured standard modules directory. Uses
+/// canonical paths so a symlink or a `..` in the path does not fool it; if the
+/// modules directory does not exist yet, nothing is inside it.
+pub fn module_is_inside_standard_dir(dir: &Path) -> bool {
+    module_is_inside(dir, &modules_dir())
+}
+
+fn module_is_inside(dir: &Path, standard: &Path) -> bool {
+    let Ok(dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let Ok(standard) = std::fs::canonicalize(standard) else {
+        return false;
+    };
+    dir.starts_with(&standard)
+}
+
+/// Move a module folder into the standard modules directory under `name`,
+/// deleting the original. Returns the new directory. Refuses when the
+/// destination already exists. Falls back to copy-then-delete across
+/// filesystems (a plain rename fails with `EXDEV`).
+pub fn move_module_into_standard_dir(src: &Path, name: &str) -> Result<PathBuf, String> {
+    move_module_into(&modules_dir(), src, name)
+}
+
+fn move_module_into(root: &Path, src: &Path, name: &str) -> Result<PathBuf, String> {
+    let dest = root.join(name);
+    if dest.exists() {
+        return Err(format!("{} already exists in the modules directory", dest.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    match std::fs::rename(src, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            copy_dir_recursive(src, &dest)?;
+            std::fs::remove_dir_all(src)
+                .map_err(|e| format!("copied to {} but could not delete the original {}: {}", dest.display(), src.display(), e))?;
+            Ok(dest)
+        }
+    }
+}
+
+/// Symlink a module folder into the standard modules directory under `name`,
+/// leaving the original in place. Returns the link path. On platforms where
+/// symlink creation is denied (e.g. Windows without the privilege), falls back
+/// to moving the folder in.
+pub fn link_module_into_standard_dir(src: &Path, name: &str) -> Result<PathBuf, String> {
+    link_module_into(&modules_dir(), src, name)
+}
+
+fn link_module_into(root: &Path, src: &Path, name: &str) -> Result<PathBuf, String> {
+    let dest = root.join(name);
+    if dest.exists() {
+        return Err(format!("{} already exists in the modules directory", dest.display()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, &dest)
+            .map_err(|e| format!("symlink {} -> {}: {}", dest.display(), src.display(), e))?;
+        Ok(dest)
+    }
+    #[cfg(windows)]
+    {
+        match std::os::windows::fs::symlink_dir(src, &dest) {
+            Ok(()) => Ok(dest),
+            // No privilege to create a symlink: move it in instead, which still
+            // gives the operator a working module in the standard place.
+            Err(_) => move_module_into(root, src, name),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (src, dest);
+        Err("linking is not supported on this platform".to_string())
+    }
+}
+
+/// Recursively copy `src` into `dst` (creating `dst`). Used as the cross-device
+/// fallback for moving a module folder.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {}", dst.display(), e))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {}", src.display(), e))?;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ty = entry.file_type().map_err(|e| format!("stat {}: {}", from.display(), e))?;
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_symlink() {
+            // Recreate the link rather than following it, so a module that
+            // symlinks into its own tree keeps working after the move.
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&from)
+                    .map_err(|e| format!("readlink {}: {}", from.display(), e))?;
+                std::os::unix::fs::symlink(&target, &to)
+                    .map_err(|e| format!("symlink {}: {}", to.display(), e))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {}", from.display(), e))?;
+            }
+        } else {
+            std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {}", from.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 /// Map a plugin's `capabilities` string to a config.json ordering list key.
 fn config_list_key(capabilities: &str) -> &'static str {
     match capabilities {
@@ -2707,6 +2893,15 @@ pub type ProcessTable = HashMap<String, Arc<Mutex<ManagedProcess>>>;
 mod tests {
     use super::*;
     use crate::plugins::ModuleManifest;
+
+    #[test]
+    fn default_backup_dir_lives_under_home() {
+        assert!(
+            default_backup_dir().ends_with(".cockatiel/backups"),
+            "got {:?}",
+            default_backup_dir()
+        );
+    }
 
     fn plugin_with_binary(dir: &Path, bin: &str, exists: bool) -> (Plugin, PathBuf) {
         let dir = dir.to_path_buf();
@@ -3999,6 +4194,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    fn scratch_modules_dir(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("ckt-{}-{}", tag, uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn move_module_into_relocates_and_deletes_the_original() {
+        let tmp = scratch_modules_dir("move");
+        let root = tmp.join("modules");
+        let src = tmp.join("elsewhere").join("mymod");
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(src.join("src").join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(src.join(crate::plugins::MANIFEST_FILENAME), r#"{"name":"mymod"}"#).unwrap();
+
+        let dest = move_module_into(&root, &src, "mymod").unwrap();
+        assert_eq!(dest, root.join("mymod"));
+        assert!(dest.join(crate::plugins::MANIFEST_FILENAME).is_file());
+        assert!(dest.join("src").join("main.rs").is_file(), "nested files moved");
+        assert!(!src.exists(), "the original is deleted (no stale copy)");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn move_module_into_refuses_an_existing_destination_and_keeps_the_source() {
+        let tmp = scratch_modules_dir("move-exists");
+        let root = tmp.join("modules");
+        let src = tmp.join("elsewhere").join("mymod");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(crate::plugins::MANIFEST_FILENAME), r#"{"name":"mymod"}"#).unwrap();
+        std::fs::create_dir_all(root.join("mymod")).unwrap();
+
+        let err = move_module_into(&root, &src, "mymod").unwrap_err();
+        assert!(err.contains("already exists"), "got: {}", err);
+        assert!(src.exists(), "source untouched on refusal");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_module_into_creates_a_symlink_and_keeps_the_original() {
+        let tmp = scratch_modules_dir("link");
+        let root = tmp.join("modules");
+        let src = tmp.join("elsewhere").join("mymod");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(crate::plugins::MANIFEST_FILENAME), r#"{"name":"mymod"}"#).unwrap();
+
+        let dest = link_module_into(&root, &src, "mymod").unwrap();
+        assert!(dest.exists());
+        assert!(
+            std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(),
+            "destination is a symlink"
+        );
+        assert!(src.exists(), "the original is kept when linking");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn module_is_inside_detects_a_prefix_and_rejects_siblings() {
+        let tmp = scratch_modules_dir("inside");
+        let root = tmp.join("modules");
+        let inside = root.join("a");
+        let outside = tmp.join("b");
+        let sibling = tmp.join("modules2");
+        for d in [&inside, &outside, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        assert!(module_is_inside(&inside, &root));
+        assert!(!module_is_inside(&outside, &root));
+        assert!(
+            !module_is_inside(&sibling, &root),
+            "a sibling whose name merely shares the prefix is not inside"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn register_adopted_sets_auto_auth_and_preserves_uuid() {
+        let tmp = scratch_modules_dir("adopted");
+        let path = tmp.join("modules.json");
+        register_adopted_at(&path, "mymod", "preprocess", 100);
+        let reg: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0]["auto_auth"], serde_json::json!(true));
+        assert_eq!(reg[0]["position"], serde_json::json!("preprocess"));
+        assert!(is_registered_at(&path, "mymod"));
+
+        // Re-adopting keeps the identity (uuid) and updates the placement.
+        let uuid = reg[0]["instance_uuid7"].clone();
+        register_adopted_at(&path, "mymod", "inprocess", 100);
+        let reg: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reg.len(), 1, "re-adopt upserts, never duplicates");
+        assert_eq!(reg[0]["instance_uuid7"], uuid);
+        assert_eq!(reg[0]["position"], serde_json::json!("inprocess"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn reorder_module_entries_applies_chain_order_and_positions_immediately() {
         // After a move the TUI must reflect the new chain order + positions
@@ -4025,6 +4324,7 @@ mod tests {
 
             authority: 0,
             price: 0,
+            min_rank: 0.0,
         };
         // Simulate the stale pre-poll state: alpha was moved to the head of the
         // chain by a Shift+up, but the local entries still show the old order.

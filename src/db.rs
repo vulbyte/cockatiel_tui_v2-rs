@@ -33,6 +33,10 @@ pub struct ModuleStatus {
     /// How much score a user must spend for the module to run on their
     /// message, from its manifest. 0 = free.
     pub price: u32,
+    /// The minimum 0-1 rank a user needs for the module to run on their
+    /// message, from its manifest. 0.0 = no rank requirement. Displayed as a
+    /// tier name (see `rank_chart`).
+    pub min_rank: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +74,42 @@ impl UserSummary {
     pub fn rank_tier(&self) -> String {
         crate::rank_chart::tier_name(self.rank)
     }
+}
+
+/// One row of the current-stream leaderboard, as reported by the
+/// `stream-leaderboard` module and cached by the engine (`stream_leaderboard`).
+#[derive(Debug, Clone, Default)]
+pub struct LeaderboardEntry {
+    pub uuid: String,
+    pub username: String,
+    /// Points earned this stream (current score − first-seen score).
+    pub earned: i32,
+    /// The user's live total score.
+    pub score: i32,
+}
+
+/// One platform adapter's report of applying the current stream control.
+#[derive(Debug, Clone, Default)]
+pub struct StreamControlStatusView {
+    pub platform: String,
+    pub revision: u64,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// The operator's desired stream control (title / scheduled start / thumbnail)
+/// plus each adapter's apply status, polled via `stream_schedule` and edited by
+/// the stream-manager window via `stream_control`.
+#[derive(Debug, Clone, Default)]
+pub struct StreamScheduleView {
+    pub title: String,
+    /// Scheduled start, epoch milliseconds. `0` = no schedule.
+    pub scheduled_start_ms: i64,
+    /// Local filesystem path to a thumbnail image.
+    pub thumbnail_path: String,
+    /// Bumped by the engine on every `stream_control` write.
+    pub revision: u64,
+    pub statuses: Vec<StreamControlStatusView>,
 }
 
 /// A single per-user key/value from the user DB (ban, timeout, name_color,
@@ -120,6 +160,15 @@ pub struct GlobalStats {
     /// broken. A `true` default can only over-report for that same 2s, and it
     /// over-reports the state that is actually true.
     pub pipeline_paused: bool,
+    /// A missing required dependency the engine is BLOCKED on (`db_status`'s
+    /// `blocked_reason`: `"user_db"` / `"timeline_db"`). While set, dispatch is
+    /// held exactly like a pause, but the modules window shows BLOCKED instead
+    /// of PAUSED so the operator knows the cause.
+    pub blocked_reason: Option<String>,
+    /// Whether the engine will open the gate by itself once the block clears
+    /// (`db_status`'s `resume_when_unblocked`). Drives the badge wording:
+    /// "will resume on clear" vs "will stay paused after clear".
+    pub resume_when_unblocked: bool,
     /// Redraw tick driving the PAUSED indicator's blink phase (see
     /// [`crate::app::pause_flash_on`]). Advanced by the draw loop, not by the
     /// engine: it lives in stats because that is the only per-frame channel
@@ -142,6 +191,13 @@ pub struct GlobalStats {
     pub user_values_epoch: u64,
     /// The last userdb error surfaced to the window (query failures, denials).
     pub user_last_error: Option<String>,
+    /// The current-stream leaderboard, polled via `stream_leaderboard` (the
+    /// `stream-leaderboard` module's cached report). Ranked by points earned
+    /// this stream, highest first.
+    pub leaderboard: Vec<LeaderboardEntry>,
+    /// The desired stream control + adapter statuses, polled via
+    /// `stream_schedule`. Edited by the stream-manager window.
+    pub stream_schedule: StreamScheduleView,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +224,8 @@ impl Default for GlobalStats {
             timeline_backup: false,
             userdb_backup: false,
             pipeline_paused: true,
+            blocked_reason: None,
+            resume_when_unblocked: false,
             pause_flash_tick: 0,
             users: Vec::new(),
             user_detail: None,
@@ -176,6 +234,8 @@ impl Default for GlobalStats {
             user_values: Vec::new(),
             user_values_epoch: 0,
             user_last_error: None,
+            leaderboard: Vec::new(),
+            stream_schedule: StreamScheduleView::default(),
         }
     }
 }
@@ -242,6 +302,31 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                 .get("pipeline_paused")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(stats.pipeline_paused);
+            // A missing/`null` reason means "not blocked". Unlike the pause
+            // flag, an absent key must CLEAR a stale block (the engine always
+            // sends the key), so a dependency that came back stops showing
+            // BLOCKED rather than sticking forever.
+            stats.blocked_reason = v
+                .get("blocked_reason")
+                .and_then(|b| b.as_str())
+                .map(|s| s.to_string());
+            stats.resume_when_unblocked = v
+                .get("resume_when_unblocked")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            // The timeline DB size + target drive the NEAR-LIMIT warning in the
+            // modules window. They were previously declared on `GlobalStats` but
+            // NEVER parsed, so `db_size_mb` stayed 0.0 and the warning was dead
+            // code. Keep the last value when a field is absent.
+            stats.db_size_mb = v
+                .get("timeline_db_size_bytes")
+                .and_then(|b| b.as_u64())
+                .map(|bytes| bytes as f32 / 1_048_576.0)
+                .unwrap_or(stats.db_size_mb);
+            stats.db_target_mb = v
+                .get("timeline_db_target_mb")
+                .and_then(|b| b.as_u64())
+                .unwrap_or(stats.db_target_mb);
         }
         return;
     }
@@ -257,6 +342,17 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                     .get("paused")
                     .and_then(|b| b.as_bool())
                     .unwrap_or(stats.pipeline_paused);
+                // The engine answers a blocked resume with the block still set
+                // and the deferred intent recorded, so adopt both rather than
+                // assuming the toggle opened the gate.
+                stats.blocked_reason = v
+                    .get("blocked_reason")
+                    .and_then(|b| b.as_str())
+                    .map(|s| s.to_string());
+                stats.resume_when_unblocked = v
+                    .get("resume_when_unblocked")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
             }
         }
         return;
@@ -334,6 +430,42 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                     stats.user_detail_epoch = stats.user_detail_epoch.wrapping_add(1);
                 }
             }
+        }
+        return;
+    }
+    // stream_leaderboard is the engine's cached copy of the stream-leaderboard
+    // module's report: { "entries": [ {uuid, username, earned, score}, ... ] }.
+    if query_id == "stream_leaderboard" && result.success {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&result.result_blob) {
+            stats.leaderboard = v
+                .get("entries")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let uuid = e.get("uuid").and_then(|x| x.as_str())?.to_string();
+                            Some(LeaderboardEntry {
+                                uuid,
+                                username: e
+                                    .get("username")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                earned: e.get("earned").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
+                                score: e.get("score").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        return;
+    }
+    // stream_schedule (the poll) and stream_control (a write's echo) share one
+    // shape: { title, scheduled_start_ms, thumbnail_path, revision, statuses }.
+    if (query_id == "stream_schedule" || query_id == "stream_control") && result.success {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&result.result_blob) {
+            stats.stream_schedule = parse_stream_schedule(&v);
         }
         return;
     }
@@ -429,6 +561,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                         let autostart = row.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
                         let authority = row.get("authority").and_then(|v| v.as_u64()).map(|x| x as u32).unwrap_or(1);
                         let price = row.get("price").and_then(|v| v.as_u64()).map(|x| x as u32).unwrap_or(0);
+                        let min_rank = row.get("min_rank").and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(0.0);
 
                         stats.module_entries.push(ModuleStatus {
                             name: name.to_string(),
@@ -443,6 +576,7 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
                             autostart,
                             authority,
                             price,
+                            min_rank,
                         });
                     }
                 }
@@ -460,6 +594,8 @@ pub fn get_pending_queries() -> Vec<(&'static str, String)> {
         ("module_list", "SELECT 1".to_string()),  // virtual query, engine returns module list
         ("db_status", "SELECT 1".to_string()),  // virtual query: timeline/userdb backup status + pipeline_paused
         ("userdb_list_users", r#"{"limit":500}"#.to_string()),  // virtual query: user DB list (score DESC)
+        ("stream_leaderboard", "{}".to_string()),  // virtual query: current-stream ranking (cached report)
+        ("stream_schedule", "{}".to_string()),  // virtual query: desired stream control + adapter statuses
     ]
 }
 
@@ -533,6 +669,31 @@ fn parse_user(v: &serde_json::Value) -> Option<UserSummary> {
     })
 }
 
+/// Parse the engine's stream-schedule object (`stream_schedule` poll, or the
+/// `stream_control` write's echo).
+fn parse_stream_schedule(v: &serde_json::Value) -> StreamScheduleView {
+    StreamScheduleView {
+        title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        scheduled_start_ms: v.get("scheduled_start_ms").and_then(|x| x.as_i64()).unwrap_or(0),
+        thumbnail_path: v.get("thumbnail_path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        revision: v.get("revision").and_then(|x| x.as_u64()).unwrap_or(0),
+        statuses: v
+            .get("statuses")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| StreamControlStatusView {
+                        platform: s.get("platform").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        revision: s.get("revision").and_then(|x| x.as_u64()).unwrap_or(0),
+                        ok: s.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                        message: s.get("message").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 /// Merge a fresh user object into the list + detail view.
 fn apply_user(stats: &mut GlobalStats, user: UserSummary) {
     if let Some(existing) = stats.users.iter_mut().find(|x| x.uuid7 == user.uuid7) {
@@ -587,6 +748,31 @@ mod tests {
         assert_eq!(stats.users[0].rank_tier(), "opal");
         assert_eq!(stats.users[1].rank_tier(), "coal");
         assert!(stats.user_last_error.is_none());
+    }
+
+    #[test]
+    fn parses_stream_leaderboard_into_stats() {
+        let mut stats = GlobalStats::default();
+        let envelope = serde_json::json!({
+            "entries": [
+                {"uuid": "u1", "username": "alice", "earned": 45, "score": 60},
+                {"uuid": "u2", "username": "bob", "earned": 20, "score": 25},
+                {"uuid": "u3", "username": "carol", "earned": -8, "score": -8},
+            ]
+        });
+        let result = userdb_result("stream_leaderboard", true, "", &envelope);
+        update_stats_from_query(&mut stats, "stream_leaderboard", &result);
+
+        assert_eq!(stats.leaderboard.len(), 3);
+        assert_eq!(stats.leaderboard[0].username, "alice");
+        assert_eq!(stats.leaderboard[0].earned, 45);
+        assert_eq!(stats.leaderboard[0].score, 60);
+        assert_eq!(stats.leaderboard[2].earned, -8);
+
+        // An empty report (the module has not run yet) yields an empty list.
+        let empty = userdb_result("stream_leaderboard", true, "", &serde_json::json!({"entries": []}));
+        update_stats_from_query(&mut stats, "stream_leaderboard", &empty);
+        assert!(stats.leaderboard.is_empty());
     }
 
     #[test]
@@ -700,6 +886,67 @@ mod tests {
             &db_status_result(r#"{"timeline_backup":true,"userdb_backup":false,"pipeline_paused":true}"#),
         );
         assert!(stats.timeline_backup && !stats.userdb_backup && stats.pipeline_paused);
+    }
+
+    #[test]
+    fn db_status_carries_the_timeline_db_size_and_target() {
+        let mut stats = GlobalStats::default();
+        // 64 MiB and a 50 MB target.
+        update_stats_from_query(
+            &mut stats,
+            "db_status",
+            &db_status_result(
+                r#"{"pipeline_paused":false,"timeline_db_size_bytes":67108864,"timeline_db_target_mb":50}"#,
+            ),
+        );
+        assert!(
+            (stats.db_size_mb - 64.0).abs() < 0.01,
+            "size bytes must be converted to MiB: {}",
+            stats.db_size_mb
+        );
+        assert_eq!(stats.db_target_mb, 50, "target must be adopted");
+
+        // An absent field keeps the last value (the engine always sends them).
+        update_stats_from_query(&mut stats, "db_status", &db_status_result(r#"{"pipeline_paused":false}"#));
+        assert!((stats.db_size_mb - 64.0).abs() < 0.01, "absent size keeps the last value");
+        assert_eq!(stats.db_target_mb, 50);
+    }
+
+    #[test]
+    fn db_status_carries_the_blocked_dependency_and_recovery_intent() {
+        let mut stats = GlobalStats::default();
+        assert!(stats.blocked_reason.is_none(), "starts unblocked");
+
+        // A blocked reason and the resume intent land.
+        update_stats_from_query(
+            &mut stats,
+            "db_status",
+            &db_status_result(r#"{"pipeline_paused":true,"blocked_reason":"user_db","resume_when_unblocked":true}"#),
+        );
+        assert_eq!(stats.blocked_reason.as_deref(), Some("user_db"));
+        assert!(stats.resume_when_unblocked);
+
+        // An absent/null reason CLEARS a stale block (the dependency came back),
+        // unlike the pause flag which holds its last value.
+        update_stats_from_query(
+            &mut stats,
+            "db_status",
+            &db_status_result(r#"{"pipeline_paused":false,"blocked_reason":null,"resume_when_unblocked":false}"#),
+        );
+        assert!(stats.blocked_reason.is_none(), "null must clear the block");
+        assert!(!stats.resume_when_unblocked);
+
+        // A resume requested while blocked answers with the block still set and
+        // the intent recorded, so the UI must adopt BOTH from the toggle reply.
+        let reply = DatabaseQueryResult {
+            query_id: "pipeline_set_paused".to_string(),
+            success: true,
+            error: String::new(),
+            result_blob: br#"{"paused":true,"changed":false,"blocked_reason":"timeline_db","resume_when_unblocked":true}"#.to_vec(),
+        };
+        update_stats_from_query(&mut stats, "pipeline_set_paused", &reply);
+        assert_eq!(stats.blocked_reason.as_deref(), Some("timeline_db"));
+        assert!(stats.resume_when_unblocked);
     }
 
     #[test]
@@ -856,6 +1103,7 @@ mod tests {
 
                 authority: 0,
                 price: 0,
+                min_rank: 0.0,
             }],
             connection: ConnectionInfo { ip: "10.0.0.1".into(), port: 9734, pin: 123456 },
             pipeline_paused: false,

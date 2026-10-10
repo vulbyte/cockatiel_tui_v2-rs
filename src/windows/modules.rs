@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -12,16 +12,38 @@ use crate::app::{PendingPrompt, Window};
 
 use crate::colors::ColorConfig;
 use crate::db::GlobalStats;
-use crate::hotkeys::{Action, HotkeyConfig};
+use crate::hotkeys::{Action, AdoptMode, HotkeyConfig};
 
-/// Whether the flashing PAUSED indicator belongs on screen this frame.
+/// The engine row's status badge for this frame, if any.
 ///
-/// `connected` is the engine link, not "has a pipeline": a disconnected TUI
-/// has no gate to report, and a connected-but-running one has nothing to warn
-/// about. `flash_on` is the blink phase — folding it in here keeps the rule
-/// testable as one truth instead of an `if` buried in the renderer.
-pub fn paused_indicator_visible(connected: bool, paused: bool, flash_on: bool) -> bool {
-    connected && paused && flash_on
+/// BLOCKED (a missing required dependency) takes precedence over PAUSED: the
+/// engine is held either way, but the CAUSE is what the operator needs to see.
+/// The BLOCKED wording states what happens when the block clears, because that
+/// is the one thing the operator cannot otherwise predict.
+///
+/// `connected` gates both (a disconnected TUI has no gate to report) and
+/// `flash_on` is the blink phase, so the whole rule stays testable as one truth.
+pub fn engine_badge(
+    connected: bool,
+    paused: bool,
+    blocked_reason: Option<&str>,
+    resume_when_unblocked: bool,
+    flash_on: bool,
+) -> Option<String> {
+    if !connected || !flash_on {
+        return None;
+    }
+    if blocked_reason.is_some() {
+        return Some(if resume_when_unblocked {
+            "BLOCKED (will resume on clear)".to_string()
+        } else {
+            "BLOCKED (will stay paused after clear)".to_string()
+        });
+    }
+    if paused {
+        return Some("PAUSED".to_string());
+    }
+    None
 }
 
 /// The label the engine row shows in the config editor's title bar. Not a
@@ -279,6 +301,21 @@ fn format_price(price: u32) -> String {
     }
 }
 
+/// The rank gate for a module, shown as a tier name in the rank column.
+///
+/// The wire value is a 0-1 `min_rank`; the DISPLAY name comes from the shared
+/// rank chart (the same one the engine gates on). `0.0` (no rank requirement)
+/// shows blank, so the column only lights up for modules that actually gate on
+/// rank — a free-of-rank module reads as cleanly as an ungated one. A rank in
+/// `(0, 1]` shows the tier whose `min` it has reached (e.g. `0.4` → `gold`).
+fn format_rank(min_rank: f32) -> String {
+    if min_rank <= 0.0 {
+        String::new()
+    } else {
+        crate::rank_chart::tier_name(min_rank)
+    }
+}
+
 /// How many messages/minute the engine could sustain at `total_ms` average
 /// end-to-end latency before the queue starts filling (the inverse of the
 /// per-message latency: `1000/ms` messages/sec, × 60 = `60000/ms`/min). Blank
@@ -345,14 +382,24 @@ const STATUS_COL: usize = 22;
 const STATUS_TEXT_COL: usize = 12;
 
 /// The fixed width of the autostart column. A module with autostart shows
-/// `A`; one without shows blank. The width keeps the ms column fixed either
-/// way.
-const AUTOSTART_COL: usize = 2;
+/// `A`; one without shows blank. Wide enough for the `AUTOSTART` column header
+/// to sit over its values, with a LEADING SPACE so the marker (and the header)
+/// does not run into the price column beside it — the price is right-aligned,
+/// so without the gap `COST` and `AUTOSTART` collide. Fixed so the ms column
+/// stays put either way.
+const AUTOSTART_COL: usize = 10;
 
 /// The fixed width of the authority-gate tag (`user`/`mod`/`admin`/`owner`)
 /// shown on every module row after the status. The engine row pads to the same
 /// width so the ms column stays aligned across rows.
 const AUTHORITY_TAG_COL: usize = 8;
+
+/// The fixed width of the rank-gate column on every module row. Shows the tier
+/// name for the module's minimum 0-1 rank (blank when there is no rank gate),
+/// so the operator sees the rank requirement at a glance. Wide enough for the
+/// longest built-in tier name (`sapphire`/`emerald`/`diamond`). The engine row
+/// pads to the same width so the ms column stays aligned across rows.
+const RANK_COL: usize = 8;
 
 /// The fixed width of the points-cost column on every module row. Shows the
 /// module's per-use price (`0` = free) so the operator sees at a glance how
@@ -473,8 +520,8 @@ fn hint_labels(row: GroupedRow, engine_removed: bool) -> &'static [&'static str]
             "edit", "start", "stop", "restart", "detach", "select", "popout", "users",
         ],
         EntryKind::Module(_) => &[
-            "start", "stop", "del", "auto", "copy", "creds", "edit", "clear", "test", "select",
-            "popout", "users",
+            "start", "stop", "del", "cost", "rank", "auto", "copy", "creds", "edit", "clear",
+            "test", "select", "popout", "users",
         ],
     }
 }
@@ -659,6 +706,170 @@ pub struct ModulesWindow {
 
     last_saved_engine: Option<Vec<EngineRestartNote>>,
 
+    /// Active add-module folder browser (`n`). Takes over the window until Esc,
+    /// exactly like the config editor.
+
+    browser: Option<ModuleBrowser>,
+
+    /// Active modal dialog: the `a` autostart confirmation, or the `c`/`r`
+    /// cost/rank editors. Consumes every key until it resolves or is cancelled,
+    /// so the operator sees exactly what is about to be written.
+
+    dialog: Option<ModuleDialog>,
+
+}
+
+/// The modules window's modal dialog. `a` confirms an autostart toggle; `c` and
+/// `r` are small text editors for the module's cost (points) and minimum-rank
+/// (0-1) gates.
+#[derive(Debug, Clone)]
+enum ModuleDialog {
+    /// `a`: confirm toggling autostart to `enable`.
+    Autostart { module: String, enable: bool },
+    /// `c`: type a new price (points).
+    Price { module: String, input: String },
+    /// `r`: type a new minimum rank (0-1).
+    Rank { module: String, input: String },
+}
+
+/// Draw the modules window's modal dialog centered over `area`: the `a`
+/// autostart confirmation, or the `c`/`r` cost/rank editors. A no-op when
+/// `dialog` is `None`.
+fn render_dialog(dialog: &Option<ModuleDialog>, area: Rect, buf: &mut Buffer, colors: &ColorConfig) {
+    let Some(dialog) = dialog else { return };
+    let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let (title, lines): (&str, Vec<(String, Style)>) = match dialog {
+        ModuleDialog::Autostart { module, enable } => (
+            " autostart ",
+            vec![
+                (
+                    format!(
+                        " {} autostart for {}?",
+                        if *enable { "Enable" } else { "Disable" },
+                        module
+                    ),
+                    bold,
+                ),
+                (String::new(), Style::default()),
+                (
+                    " Autostart modules launch when the engine starts.".to_string(),
+                    Style::default().fg(Color::Gray),
+                ),
+                (String::new(), Style::default()),
+                (
+                    " [y] yes    [n/esc] no".to_string(),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ],
+        ),
+        ModuleDialog::Price { module, input } => (
+            " cost ",
+            vec![
+                (format!(" Cost (points) for {module}:"), bold),
+                (String::new(), Style::default()),
+                (format!(" > {input}"), Style::default().fg(Color::White)),
+                (String::new(), Style::default()),
+                (
+                    " Enter to save   esc to cancel   (empty = free)".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ],
+        ),
+        ModuleDialog::Rank { module, input } => (
+            " rank ",
+            vec![
+                (format!(" Minimum rank (0-1) for {module}:"), bold),
+                (String::new(), Style::default()),
+                (format!(" > {input}"), Style::default().fg(Color::White)),
+                (String::new(), Style::default()),
+                (
+                    " Enter to save   esc to cancel   (0 = no gate)".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ],
+        ),
+    };
+
+    let w = 66u16.min(area.width.saturating_sub(2)).max(24);
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    // Clear the region first so the list does not show through the dialog.
+    ratatui::widgets::Clear.render(rect, buf);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors.active_border_color("modules")));
+    let inner = rect.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+
+    for (i, (text, style)) in lines.iter().enumerate() {
+        if (i as u16) >= inner.height {
+            break;
+        }
+        Line::from(Span::styled(text.clone(), *style)).render(
+            Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
+    block.render(rect, buf);
+}
+
+/// How a file/folder in the add-module browser should be presented. Drives the
+/// row colour only — selection is by path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserKind {
+    /// The `../` row at the top (go up one directory).
+    Parent,
+    /// A `cockatiel_module_info.json` file — the thing the operator is looking
+    /// for. Rendered green.
+    Manifest,
+    /// A directory that contains a manifest within one level. Rendered yellow.
+    ModuleFolder,
+    /// Anything else. Rendered light gray.
+    Other,
+}
+
+/// One row in the add-module folder browser.
+#[derive(Debug, Clone)]
+pub struct BrowserEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub kind: BrowserKind,
+}
+
+/// A module the operator has selected in the browser, awaiting confirmation.
+#[derive(Debug, Clone)]
+pub struct PendingAdopt {
+    /// The module directory (the manifest's parent).
+    pub module_dir: PathBuf,
+    /// The manifest's declared module name.
+    pub module_name: String,
+    /// The folder lives outside the standard modules directory.
+    pub outside: bool,
+    /// The module name is already present in `modules.json`.
+    pub already_known: bool,
+}
+
+/// The add-module folder browser state. A single `cwd` with its entries; the
+/// `../` row is always first. `confirm` is step 1 (add?); `relink` is step 2
+/// (move/link, only when the folder is outside the standard directory).
+#[derive(Debug, Clone)]
+pub struct ModuleBrowser {
+    pub cwd: PathBuf,
+    pub entries: Vec<BrowserEntry>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub confirm: Option<PendingAdopt>,
+    pub relink: Option<PendingAdopt>,
 }
 
 /// One step in a config path (a map key or an array index).
@@ -845,6 +1056,8 @@ impl ModulesWindow {
             editing: None,
             last_saved_module: None,
             last_saved_engine: None,
+            browser: None,
+            dialog: None,
         }
     }
 
@@ -1569,6 +1782,400 @@ impl ModulesWindow {
     }
 }
 
+/// The manifest filename the browser looks for (kept in sync with
+/// `crate::plugins::MANIFEST_FILENAME`).
+const MODULE_MANIFEST_FILENAME: &str = "cockatiel_module_info.json";
+
+/// True when `dir` contains a `cockatiel_module_info.json` directly OR exactly
+/// one level below it. The one-level peek is the browser's hint: a folder that
+/// leads to a module is tinted yellow. Bounded to one level so a huge tree
+/// never turns a keystroke into a recursive scan.
+pub fn dir_has_manifest(dir: &Path) -> bool {
+    if dir.join(MODULE_MANIFEST_FILENAME).is_file() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() && p.join(MODULE_MANIFEST_FILENAME).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read a manifest's declared `name` without a full plugin load (used to label
+/// the confirm dialog even when the manifest is otherwise unusable).
+fn read_manifest_name(dir: &Path) -> Option<String> {
+    let data = std::fs::read_to_string(dir.join(MODULE_MANIFEST_FILENAME)).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&data).ok()?;
+    root.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// List `cwd`'s entries for the browser: the `../` row first, then directories,
+/// then files, each alphabetical. Directories that lead to a module (1-level
+/// peek) and manifest files carry the colour hint.
+pub fn browser_entries(cwd: &Path) -> Vec<BrowserEntry> {
+    let mut dirs: Vec<BrowserEntry> = Vec::new();
+    let mut files: Vec<BrowserEntry> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(cwd) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = path.is_dir();
+            let kind = if is_dir {
+                if dir_has_manifest(&path) {
+                    BrowserKind::ModuleFolder
+                } else {
+                    BrowserKind::Other
+                }
+            } else if name == MODULE_MANIFEST_FILENAME {
+                BrowserKind::Manifest
+            } else {
+                BrowserKind::Other
+            };
+            let be = BrowserEntry { path, name, is_dir, kind };
+            if is_dir {
+                dirs.push(be);
+            } else {
+                files.push(be);
+            }
+        }
+    }
+    dirs.sort_by_key(|e| e.name.to_lowercase());
+    files.sort_by_key(|e| e.name.to_lowercase());
+
+    let parent = cwd.parent().unwrap_or(cwd).to_path_buf();
+    let mut out = Vec::with_capacity(dirs.len() + files.len() + 1);
+    out.push(BrowserEntry {
+        path: parent,
+        name: "../".to_string(),
+        is_dir: true,
+        kind: BrowserKind::Parent,
+    });
+    out.extend(dirs);
+    out.extend(files);
+    out
+}
+
+impl ModulesWindow {
+    /// Open the add-module browser at `start` (a directory), or the current
+    /// working directory when `start` is not a directory.
+    fn open_browser(&mut self, start: PathBuf) {
+        let cwd = if start.is_dir() {
+            start
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        };
+        let entries = browser_entries(&cwd);
+        self.browser = Some(ModuleBrowser {
+            cwd,
+            entries,
+            selected: 0,
+            scroll: 0,
+            confirm: None,
+            relink: None,
+        });
+    }
+
+    /// Build the pending-adopt record for a selected manifest file.
+    fn pending_adopt_for(&self, manifest: &Path) -> Option<PendingAdopt> {
+        let module_dir = manifest.parent()?.to_path_buf();
+        let module_name = crate::plugins::load_plugin_quiet(&module_dir)
+            .map(|p| p.manifest.name)
+            .or_else(|| read_manifest_name(&module_dir))
+            .or_else(|| module_dir.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "module".to_string());
+        let outside = !crate::supervisor::module_is_inside_standard_dir(&module_dir);
+        let already_known = crate::supervisor::is_registered(&module_name);
+        Some(PendingAdopt {
+            module_dir,
+            module_name,
+            outside,
+            already_known,
+        })
+    }
+
+    /// Handle a key while the browser is open. Returns the resolved action
+    /// (`AdoptModule`) or `Some(Action::Noop)` when consumed.
+    fn browser_key_impl(&mut self, key: crossterm::event::KeyEvent, _hotkeys: &HotkeyConfig) -> Option<Action> {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        // Borrow the browser state; take() it so we can mutate `self` freely
+        // (navigation reloads entries through `self`).
+        let mut b = self.browser.take()?;
+
+        // Step 2: relink choice for an outside folder.
+        if let Some(pending) = b.relink.clone() {
+            match key.code {
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.browser = None;
+                    return Some(Action::AdoptModule(pending.module_dir, AdoptMode::Move));
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.browser = None;
+                    return Some(Action::AdoptModule(pending.module_dir, AdoptMode::Link));
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+                    b.relink = None;
+                    self.browser = Some(b);
+                    return Some(Action::Noop);
+                }
+                _ => {
+                    self.browser = Some(b);
+                    return Some(Action::Noop);
+                }
+            }
+        }
+
+        // Step 1: confirm.
+        if let Some(pending) = b.confirm.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    if pending.outside {
+                        // Escalate to the move/link choice.
+                        b.confirm = None;
+                        b.relink = Some(pending);
+                        self.browser = Some(b);
+                        return Some(Action::Noop);
+                    }
+                    self.browser = None;
+                    return Some(Action::AdoptModule(pending.module_dir, AdoptMode::InPlace));
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    b.confirm = None;
+                    self.browser = Some(b);
+                    return Some(Action::Noop);
+                }
+                _ => {
+                    self.browser = Some(b);
+                    return Some(Action::Noop);
+                }
+            }
+        }
+
+        // Navigation.
+        let total = b.entries.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if total > 0 {
+                    b.selected = (b.selected + 1).min(total - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                b.selected = b.selected.saturating_sub(1);
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                let parent = b.cwd.parent().map(|p| p.to_path_buf());
+                if let Some(parent) = parent {
+                    b.cwd = parent;
+                    b.selected = 0;
+                    b.scroll = 0;
+                    b.entries = browser_entries(&b.cwd);
+                }
+            }
+            KeyCode::Esc => {
+                self.browser = None;
+                return Some(Action::Noop);
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = b.entries.get(b.selected).cloned() {
+                    match entry.kind {
+                        BrowserKind::Parent => {
+                            b.cwd = entry.path;
+                            b.selected = 0;
+                            b.scroll = 0;
+                            b.entries = browser_entries(&b.cwd);
+                        }
+                        BrowserKind::ModuleFolder => {
+                            // A folder that leads to a module: descend into it
+                            // so the operator can pick the manifest file.
+                            b.cwd = entry.path;
+                            b.selected = 0;
+                            b.scroll = 0;
+                            b.entries = browser_entries(&b.cwd);
+                        }
+                        BrowserKind::Manifest => {
+                            if let Some(pending) = self.pending_adopt_for(&entry.path) {
+                                b.confirm = Some(pending);
+                            }
+                        }
+                        BrowserKind::Other => {
+                            if entry.is_dir {
+                                b.cwd = entry.path;
+                                b.selected = 0;
+                                b.scroll = 0;
+                                b.entries = browser_entries(&b.cwd);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.browser = Some(b);
+        Some(Action::Noop)
+    }
+
+    /// Render the browser, taking over the whole window.
+    fn render_browser(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, colors: &ColorConfig) {
+        let Some(b) = &mut self.browser else { return };
+        let border_color = if is_active {
+            colors.active_border_color("modules")
+        } else {
+            colors.border_color("inactive")
+        };
+        let block = Block::default()
+            .title(" add module ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color));
+        let inner = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
+        let mut y = inner.y;
+
+        // Current folder.
+        if y < inner.y + inner.height {
+            let path = b.cwd.to_string_lossy().to_string();
+            Line::from(Span::styled(format!(" {}", path), Style::default().fg(Color::Cyan)))
+                .render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+            y += 1;
+        }
+        // Hint line.
+        if y < inner.y + inner.height {
+            let help = " j/k move \u{00b7} Enter open/select \u{00b7} Backspace up \u{00b7} Esc cancel ";
+            Line::from(Span::styled(help, Style::default().fg(Color::DarkGray)))
+                .render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+            y += 1;
+        }
+
+        let list_top = y;
+        let list_h = (inner.y + inner.height).saturating_sub(list_top) as usize;
+        let total = b.entries.len();
+        if total > 0 {
+            b.selected = b.selected.min(total - 1);
+            if b.selected < b.scroll {
+                b.scroll = b.selected;
+            }
+            if list_h > 0 && b.selected >= b.scroll + list_h {
+                b.scroll = b.selected + 1 - list_h;
+            }
+            if list_h > 0 && b.scroll + list_h > total {
+                b.scroll = total.saturating_sub(list_h);
+            }
+        } else {
+            b.selected = 0;
+            b.scroll = 0;
+        }
+
+        if total == 0 && y < inner.y + inner.height {
+            Line::from(Span::styled(" (empty)", Style::default().fg(Color::DarkGray)))
+                .render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+        }
+
+        for (row, (i, entry)) in (list_top..)
+            .zip(b.entries.iter().enumerate().skip(b.scroll).take(list_h.max(1)))
+        {
+            if row >= inner.y + inner.height {
+                break;
+            }
+            let selected = i == b.selected && is_active;
+            let base = match entry.kind {
+                BrowserKind::Manifest => Style::default().fg(Color::Green),
+                BrowserKind::ModuleFolder => Style::default().fg(Color::Yellow),
+                BrowserKind::Parent | BrowserKind::Other => Style::default().fg(Color::Gray),
+            };
+            let row_style = if selected {
+                base.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            let marker = if selected { "\u{25b8} " } else { "  " };
+            let mut spans = vec![Span::styled(marker, Style::default().fg(Color::Cyan))];
+            let label = if entry.kind == BrowserKind::Parent {
+                "../".to_string()
+            } else {
+                entry.name.clone()
+            };
+            spans.push(Span::styled(label, row_style));
+            if entry.kind == BrowserKind::Parent {
+                spans.push(Span::styled(
+                    format!("  {}", entry.path.to_string_lossy()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else if entry.is_dir {
+                spans.push(Span::styled("/", Style::default().fg(Color::DarkGray)));
+            }
+            Line::from(spans).render(Rect { x: inner.x, y: row, width: inner.width, height: 1 }, buf);
+        }
+
+        block.render(area, buf);
+        self.render_browser_dialog(area, buf, colors);
+    }
+
+    /// Render the confirm (step 1) or move/link (step 2) dialog over the list.
+    fn render_browser_dialog(&self, area: Rect, buf: &mut Buffer, _colors: &ColorConfig) {
+        let Some(b) = &self.browser else { return };
+        let (title, lines): (&str, Vec<Line>) = if let Some(p) = &b.relink {
+            let standard = crate::supervisor::modules_dir();
+            (
+                " add module ",
+                vec![
+                    Line::from(Span::styled(
+                        format!(" '{}' lives outside the standard modules folder.", p.module_name),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled(
+                        format!(" Standard location: {}", standard.display()),
+                        Style::default().fg(Color::Gray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " [m]ove here (deletes the original)   [l]ink   [c]ancel ",
+                        Style::default().fg(Color::White),
+                    )),
+                ],
+            )
+        } else if let Some(p) = &b.confirm {
+            let first = if p.already_known {
+                format!(" Module '{}' is already added.", p.module_name)
+            } else {
+                format!(" Add module '{}'?", p.module_name)
+            };
+            let second = if p.already_known {
+                " Re-add and relaunch it?"
+            } else {
+                " It will be registered and launched."
+            };
+            (
+                " confirm ",
+                vec![
+                    Line::from(Span::styled(first, Style::default().fg(Color::Green))),
+                    Line::from(Span::styled(second, Style::default().fg(Color::Gray))),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " [y]es   [n]o ",
+                        Style::default().fg(Color::White),
+                    )),
+                ],
+            )
+        } else {
+            return;
+        };
+
+        let w = 62u16.min(area.width);
+        let h = (lines.len() as u16 + 2).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let dialog = Rect { x, y, width: w, height: h };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        Paragraph::new(lines).block(block).render(dialog, buf);
+    }
+}
+
 impl Window for ModulesWindow {
 
     fn selected_module_name(&self, stats: &GlobalStats) -> Option<String> {
@@ -1618,6 +2225,11 @@ impl Window for ModulesWindow {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, stats: &GlobalStats, colors: &ColorConfig, hotkeys: &HotkeyConfig, prompts: &[PendingPrompt]) {
+        // Add-module browser takes over the whole window.
+        if self.browser.is_some() {
+            self.render_browser(area, buf, is_active, colors);
+            return;
+        }
         // Config editor takes over the whole window.
         if self.editing.is_some() {
             self.render_editor(area, buf, is_active, colors, prompts);
@@ -1684,7 +2296,28 @@ impl Window for ModulesWindow {
         );
         let inner = hotkey.content;
 
-        let mut y = inner.y;
+        // Column header, so a new operator can read the list at a glance. It
+        // names the columns every row below fills, using the SAME fixed widths
+        // as the rows so each label sits over its column. Fixed — it does not
+        // scroll with the list.
+        let header = format!(
+            "  {:<nw$}{:<sw$} {:<aw$} {:<rw$}{:>pw$}{:<asw$}{:>mw$}{:>tw$}",
+            "MODULE", "STATUS", "ROLE", "RANK", "COST", " AUTOSTART", "TIME", "RATE",
+            nw = STATUS_COL,
+            sw = STATUS_TEXT_COL,
+            aw = AUTHORITY_TAG_COL,
+            rw = RANK_COL,
+            pw = PRICE_COL,
+            asw = AUTOSTART_COL,
+            mw = MS_COL,
+            tw = THROUGHPUT_COL,
+        );
+        Line::from(Span::styled(
+            header,
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        ))
+        .render(Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 }, buf);
+        let mut y = inner.y + 1;
 
         // ── the list: grouped sections, ENGINE first then each stage ──
         //
@@ -1770,7 +2403,7 @@ impl Window for ModulesWindow {
                             // the same 2-space row indent + the authority tag a
                             // module row has (the header label carries the
                             // indent too).
-                            let ms_start = 2 + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + PRICE_COL + AUTOSTART_COL;
+                            let ms_start = 2 + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + RANK_COL + 1 + PRICE_COL + AUTOSTART_COL;
                             let pad = ms_start.saturating_sub(header_name.len());
                             let header_style = if is_selected {
                                 row_style
@@ -1840,6 +2473,12 @@ impl Window for ModulesWindow {
                                     format!("{:<width$}", "", width = AUTHORITY_TAG_COL + 1),
                                     row_style,
                                 ),
+                                // The engine has no rank gate either; pad the
+                                // rank column so the ms column stays aligned.
+                                Span::styled(
+                                    format!("{:<width$}", "", width = RANK_COL + 1),
+                                    row_style,
+                                ),
                             ];
                             // Flashing PAUSED, placed in the space where the
                             // autostart marker would sit on a module row (the
@@ -1848,15 +2487,18 @@ impl Window for ModulesWindow {
                             // warning-but-not-broken colour as the NEAR-LIMIT
                             // row below rather than a hard red: a held pipeline
                             // is the engine working as designed, not a fault.
-                            let paused_text = if paused_indicator_visible(
+                            // BLOCKED (a missing timeline/user DB) outranks
+                            // PAUSED; both are the engine deliberately holding
+                            // dispatch. The badge's wording says whether the
+                            // engine will open the gate by itself once the block
+                            // clears.
+                            let badge = engine_badge(
                                 engine_live,
                                 stats.pipeline_paused,
+                                stats.blocked_reason.as_deref(),
+                                stats.resume_when_unblocked,
                                 crate::app::AppState::pause_flash_on(stats.pause_flash_tick),
-                            ) {
-                                Some("PAUSED")
-                            } else {
-                                None
-                            };
+                            );
                             // The engine's total: the sum of every module's
                             // rolling average, right-aligned in the same fixed
                             // ms column (absolute x = the module rows' ms
@@ -1870,7 +2512,7 @@ impl Window for ModulesWindow {
                             let indent = 2;
                             // Matches the module rows: name + status + authority
                             // tag (+leading space) + price + autostart, then the ms col.
-                            let ms_start = indent + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + PRICE_COL + AUTOSTART_COL;
+                            let ms_start = indent + STATUS_COL + STATUS_TEXT_COL + AUTHORITY_TAG_COL + 1 + RANK_COL + 1 + PRICE_COL + AUTOSTART_COL;
                             let ms_right = ms_start + MS_COL;
                             // Everything rendered so far: name + status. The
                             // badge (if any) then the ms must end at `ms_right`.
@@ -1879,11 +2521,18 @@ impl Window for ModulesWindow {
                             // The badge consumes gap space; if it overflows the
                             // autostart column the ms still right-aligns to the
                             // fixed right edge.
-                            if let Some(badge) = paused_text {
+                            if let Some(badge) = badge {
+                                // BLOCKED is a fault (red); PAUSED is the engine
+                                // working as designed (warning colour).
+                                let badge_color = if stats.blocked_reason.is_some() {
+                                    Color::Red
+                                } else {
+                                    colors.status_color("stopped")
+                                };
                                 spans.push(Span::styled(
                                     format!("{badge:>width$}", width = gap.saturating_add(badge.len())),
                                     row_style
-                                        .fg(if is_selected { Color::Black } else { colors.status_color("stopped") })
+                                        .fg(if is_selected { Color::Black } else { badge_color })
                                         .add_modifier(Modifier::BOLD),
                                 ));
                                 gap = 0;
@@ -1962,6 +2611,18 @@ impl Window for ModulesWindow {
                                     Color::Magenta
                                 }),
                             ));
+                            // Rank gate (from the manifest): the minimum tier a
+                            // user needs for the module to run on their message.
+                            // Blank when there is no rank requirement, so the
+                            // column only lights up for rank-gated modules.
+                            spans.push(Span::styled(
+                                format!(" {:<width$}", format_rank(module.min_rank), width = RANK_COL),
+                                row_style.fg(if is_selected {
+                                    Color::Black
+                                } else {
+                                    Color::Yellow
+                                }),
+                            ));
                             // Points cost (from the manifest): what a user's
                             // score is charged when the module runs on their
                             // message. `0` = free. Shown right-aligned after the
@@ -1978,7 +2639,7 @@ impl Window for ModulesWindow {
                             // Autostart marker: `A` for a module set to start
                             // automatically, blank otherwise — a fixed column
                             // so the ms never shifts.
-                            let autostart_text = if module.autostart { "A" } else { "" };
+                            let autostart_text = if module.autostart { " A" } else { "" };
                             spans.push(Span::styled(
                                 format!("{:<width$}", autostart_text, width = AUTOSTART_COL),
                                 row_style.fg(if is_selected {
@@ -2121,6 +2782,10 @@ impl Window for ModulesWindow {
 
         // Hotkey bar (already wrapped above).
         Paragraph::new(hotkey.lines).render(hotkey.area, buf);
+
+        // Modal dialog (autostart confirmation / cost / rank editors), drawn as
+        // an overlay on top of the list.
+        render_dialog(&self.dialog, area, buf, colors);
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent, stats: &mut GlobalStats) -> Option<Action> {
@@ -2229,6 +2894,94 @@ impl Window for ModulesWindow {
 
     fn in_editor(&self) -> bool {
         self.editing.is_some()
+    }
+
+    fn in_browser(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    fn browser_key(&mut self, key: crossterm::event::KeyEvent, hotkeys: &HotkeyConfig) -> Option<Action> {
+        self.browser_key_impl(key, hotkeys)
+    }
+
+    fn open_module_browser(&mut self, start: PathBuf) {
+        self.open_browser(start);
+    }
+
+    fn in_dialog(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    fn dialog_key(&mut self, key: crossterm::event::KeyEvent) -> Option<Action> {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        let dialog = self.dialog.take()?;
+        match dialog {
+            ModuleDialog::Autostart { module, enable } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Some(Action::SetAutostart(module, enable))
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(Action::Noop),
+                _ => {
+                    // Any other key is consumed but keeps the dialog open.
+                    self.dialog = Some(ModuleDialog::Autostart { module, enable });
+                    Some(Action::Noop)
+                }
+            },
+            ModuleDialog::Price { module, mut input } => match key.code {
+                KeyCode::Enter => Some(Action::SetModulePrice(module, input)),
+                KeyCode::Esc => Some(Action::Noop),
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.dialog = Some(ModuleDialog::Price { module, input });
+                    Some(Action::Noop)
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() && input.chars().count() < 9 => {
+                    input.push(c);
+                    self.dialog = Some(ModuleDialog::Price { module, input });
+                    Some(Action::Noop)
+                }
+                _ => {
+                    self.dialog = Some(ModuleDialog::Price { module, input });
+                    Some(Action::Noop)
+                }
+            },
+            ModuleDialog::Rank { module, mut input } => match key.code {
+                KeyCode::Enter => Some(Action::SetModuleRank(module, input)),
+                KeyCode::Esc => Some(Action::Noop),
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.dialog = Some(ModuleDialog::Rank { module, input });
+                    Some(Action::Noop)
+                }
+                KeyCode::Char(c)
+                    if (c.is_ascii_digit() || c == '.') && input.chars().count() < 6 =>
+                {
+                    input.push(c);
+                    self.dialog = Some(ModuleDialog::Rank { module, input });
+                    Some(Action::Noop)
+                }
+                _ => {
+                    self.dialog = Some(ModuleDialog::Rank { module, input });
+                    Some(Action::Noop)
+                }
+            },
+        }
+    }
+
+    fn open_autostart_dialog(&mut self, module: String, current: bool) {
+        self.dialog = Some(ModuleDialog::Autostart {
+            module,
+            enable: !current,
+        });
+    }
+
+    fn open_price_dialog(&mut self, module: String, current: String) {
+        self.dialog = Some(ModuleDialog::Price { module, input: current });
+    }
+
+    fn open_rank_dialog(&mut self, module: String, current: String) {
+        self.dialog = Some(ModuleDialog::Rank { module, input: current });
     }
 
 fn editor_key(&mut self, key: crossterm::event::KeyEvent, hotkeys: &HotkeyConfig) -> bool {
@@ -2431,6 +3184,7 @@ mod tests {
 
             authority: 0,
             price: 0,
+            min_rank: 0.0,
         }
     }
 
@@ -2681,18 +3435,33 @@ SECRET=s3
     /// pure rule and through the real renderer, because a renderer's `if` can
     /// drift from the function it is supposed to be calling.
     #[test]
-    fn the_paused_indicator_needs_a_connected_paused_engine() {
-        use super::paused_indicator_visible;
-        // Connected + paused → shown (in its visible phase).
-        assert!(paused_indicator_visible(true, true, true));
-        // Connected + running → nothing to report.
-        assert!(!paused_indicator_visible(true, false, true));
-        // Disconnected + paused → there is no engine holding anything.
-        assert!(!paused_indicator_visible(false, true, true));
-        // Disconnected + running.
-        assert!(!paused_indicator_visible(false, false, true));
-        // The blink's dark phase hides it even when paused: that is the flash.
-        assert!(!paused_indicator_visible(true, true, false));
+    fn the_engine_badge_prefers_blocked_over_paused_and_words_the_recovery() {
+        use super::engine_badge;
+        // Not connected → no badge, whatever else is true.
+        assert_eq!(engine_badge(false, true, Some("user_db"), true, true), None);
+        // Dark half of the blink → hidden.
+        assert_eq!(engine_badge(true, true, Some("user_db"), true, false), None);
+        // Blocked outranks paused, and the wording tracks the deferred intent.
+        assert_eq!(
+            engine_badge(true, true, Some("user_db"), true, true).as_deref(),
+            Some("BLOCKED (will resume on clear)")
+        );
+        assert_eq!(
+            engine_badge(true, true, Some("timeline_db"), false, true).as_deref(),
+            Some("BLOCKED (will stay paused after clear)")
+        );
+        // A blocked engine that is not "paused" still shows BLOCKED.
+        assert_eq!(
+            engine_badge(true, false, Some("timeline_db"), false, true).as_deref(),
+            Some("BLOCKED (will stay paused after clear)")
+        );
+        // No block → the plain pause badge.
+        assert_eq!(
+            engine_badge(true, true, None, false, true).as_deref(),
+            Some("PAUSED")
+        );
+        // Running and unblocked → nothing.
+        assert_eq!(engine_badge(true, false, None, false, true), None);
     }
 
     #[test]
@@ -2794,6 +3563,133 @@ SECRET=s3
         assert!(all.contains('\u{2502}'), "no tree lines: {}", all);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn render_shows_column_headers_above_the_list() {
+        let mut w = ModulesWindow::new();
+        let stats = stats_with_modules(2);
+        let screen = render(&mut w, &stats, 120, 30);
+        for label in ["MODULE", "STATUS", "ROLE", "RANK", "COST", "AUTOSTART", "TIME"] {
+            assert!(screen.contains(label), "missing column header {label:?}:\n{screen}");
+        }
+        // The header sits ABOVE the first group header, so it reads as a table.
+        let header = screen.find("MODULE").expect("MODULE header");
+        let engine = screen.find("[ENGINE]").expect("[ENGINE] header");
+        assert!(header < engine, "column header must precede the list:\n{screen}");
+    }
+
+    fn dialog_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn autostart_dialog_confirms_with_set_autostart() {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        let mut w = ModulesWindow::new();
+        assert!(!w.in_dialog());
+        // Opening targets the OPPOSITE of the current state (false -> enable).
+        w.open_autostart_dialog("m0".to_string(), false);
+        assert!(w.in_dialog());
+        let action = w.dialog_key(dialog_key(KeyCode::Enter));
+        assert_eq!(action, Some(Action::SetAutostart("m0".to_string(), true)));
+        assert!(!w.in_dialog(), "confirm closes the dialog");
+
+        // `y` confirms too, and a module already on targets disable.
+        w.open_autostart_dialog("m1".to_string(), true);
+        let action = w.dialog_key(dialog_key(KeyCode::Char('y')));
+        assert_eq!(action, Some(Action::SetAutostart("m1".to_string(), false)));
+    }
+
+    #[test]
+    fn autostart_dialog_cancels_with_esc_or_n() {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        let mut w = ModulesWindow::new();
+        w.open_autostart_dialog("m0".to_string(), true);
+        assert_eq!(w.dialog_key(dialog_key(KeyCode::Esc)), Some(Action::Noop));
+        assert!(!w.in_dialog(), "esc closes the dialog");
+
+        w.open_autostart_dialog("m0".to_string(), true);
+        assert_eq!(w.dialog_key(dialog_key(KeyCode::Char('n'))), Some(Action::Noop));
+        assert!(!w.in_dialog(), "n closes the dialog");
+    }
+
+    #[test]
+    fn autostart_dialog_renders_the_module_and_action() {
+        let mut w = ModulesWindow::new();
+        let stats = stats_with_modules(2);
+        w.open_autostart_dialog("m0".to_string(), false);
+        let screen = render(&mut w, &stats, 120, 30);
+        assert!(screen.contains(" autostart "), "dialog title missing:\n{screen}");
+        assert!(
+            screen.contains("Enable autostart for m0?"),
+            "dialog prompt missing:\n{screen}"
+        );
+        assert!(screen.contains("[y] yes"), "dialog hint missing:\n{screen}");
+    }
+
+    #[test]
+    fn cost_dialog_edits_and_submits_a_price() {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        let mut w = ModulesWindow::new();
+        // Prefilled with the current value ("10"); backspace twice, type 42.
+        w.open_price_dialog("m0".to_string(), "10".to_string());
+        assert!(w.in_dialog());
+        w.dialog_key(dialog_key(KeyCode::Backspace));
+        w.dialog_key(dialog_key(KeyCode::Backspace));
+        w.dialog_key(dialog_key(KeyCode::Char('4')));
+        w.dialog_key(dialog_key(KeyCode::Char('2')));
+        let action = w.dialog_key(dialog_key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Some(Action::SetModulePrice("m0".to_string(), "42".to_string()))
+        );
+        assert!(!w.in_dialog(), "submit closes the dialog");
+
+        // Non-digit keys are ignored; empty input submits as-is (free).
+        w.open_price_dialog("m0".to_string(), String::new());
+        w.dialog_key(dialog_key(KeyCode::Char('x')));
+        let action = w.dialog_key(dialog_key(KeyCode::Enter));
+        assert_eq!(action, Some(Action::SetModulePrice("m0".to_string(), String::new())));
+    }
+
+    #[test]
+    fn rank_dialog_accepts_a_decimal_and_cancels_with_esc() {
+        use crate::hotkeys::Action;
+        use crossterm::event::KeyCode;
+        let mut w = ModulesWindow::new();
+        w.open_rank_dialog("m0".to_string(), String::new());
+        for c in "0.5".chars() {
+            w.dialog_key(dialog_key(KeyCode::Char(c)));
+        }
+        let action = w.dialog_key(dialog_key(KeyCode::Enter));
+        assert_eq!(action, Some(Action::SetModuleRank("m0".to_string(), "0.5".to_string())));
+
+        w.open_rank_dialog("m0".to_string(), "0.25".to_string());
+        assert_eq!(w.dialog_key(dialog_key(KeyCode::Esc)), Some(Action::Noop));
+        assert!(!w.in_dialog(), "esc closes the dialog");
+    }
+
+    #[test]
+    fn cost_and_rank_dialogs_render() {
+        let mut w = ModulesWindow::new();
+        let stats = stats_with_modules(1);
+        w.open_price_dialog("m0".to_string(), "42".to_string());
+        let screen = render(&mut w, &stats, 120, 30);
+        assert!(screen.contains(" cost "), "cost title missing:\n{screen}");
+        assert!(screen.contains("Cost (points) for m0:"), "cost prompt missing:\n{screen}");
+        assert!(screen.contains("> 42"), "cost input missing:\n{screen}");
+
+        w.open_rank_dialog("m0".to_string(), "0.50".to_string());
+        let screen = render(&mut w, &stats, 120, 30);
+        assert!(screen.contains(" rank "), "rank title missing:\n{screen}");
+        assert!(
+            screen.contains("Minimum rank (0-1) for m0:"),
+            "rank prompt missing:\n{screen}"
+        );
     }
 
     #[test]
@@ -4025,8 +4921,8 @@ mod engine_row_tests {
         assert_eq!(
             bar_labels(&bar),
             vec![
-                "nav", "start", "stop", "del", "auto", "copy", "creds", "edit", "clear", "test",
-                "select", "users", "pause"
+                "nav", "start", "stop", "del", "cost", "rank", "auto", "copy", "creds", "edit",
+                "clear", "test", "select", "users", "pause"
             ],
             "module bar:\n{}",
             bar
@@ -4377,6 +5273,49 @@ mod engine_row_tests {
     fn ms_end_in(line: &str) -> usize {
         let ms = "4.2ms";
         line.find(ms).unwrap() + ms.len()
+    }
+
+    /// The rank-gate column shows the TIER a user needs (from the shared rank
+    /// chart) and stays blank when there is no rank requirement, and it is a
+    /// fixed column so the ms column does not shift between rows.
+    #[test]
+    fn the_rank_column_shows_the_minimum_tier_and_stays_aligned() {
+        let mut w = super::ModulesWindow::new();
+        let mut stats = stats_with(&[
+            ("tts-service", "postprocess"),
+            ("language-constrainer", "inprocess"),
+            ("banned-words", "preprocess"),
+        ]);
+        stats.module_entries.iter_mut().for_each(|m| match m.name.as_str() {
+            "tts-service" => { m.min_rank = 0.9; m.avg_ms = Some(4.2); } // opal
+            "language-constrainer" => { m.min_rank = 0.4; m.avg_ms = Some(4.2); } // gold
+            "banned-words" => { m.min_rank = 0.0; m.avg_ms = Some(4.2); } // no gate
+            _ => {}
+        });
+        let screen = super::tests::render(&mut w, &stats, 120, 30);
+        let line = |needle: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
+        };
+        assert!(line("tts-service").contains(" opal"), "0.9 -> opal: {}", line("tts-service"));
+        assert!(line("language-constrainer").contains(" gold"), "0.4 -> gold");
+        assert!(
+            !line("banned-words").contains("coal"),
+            "no rank gate must render blank, not the lowest tier: {}",
+            line("banned-words")
+        );
+        // The rank column is fixed, so every row's ms still ends at the same x.
+        assert_eq!(
+            ms_end_in(&line("tts-service")),
+            ms_end_in(&line("banned-words")),
+            "a rank value must not shift the ms column"
+        );
+        assert_eq!(
+            ms_end_in(&line("language-constrainer")),
+            ms_end_in(&line("banned-words"))
+        );
     }
 
     /// The engine's end-to-end latency is shown in ONE place (the engine row,
@@ -4780,4 +5719,152 @@ mod engine_row_tests {
 
 
 
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ckt-browser-{}-{}", tag, uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn empty_hotkeys() -> HotkeyConfig {
+        HotkeyConfig {
+            global: HashMap::new(),
+            window_actions: HashMap::new(),
+            editor_actions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn dir_has_manifest_direct_and_one_level_only() {
+        let t = scratch("manifest");
+
+        // Direct manifest.
+        let direct = t.join("direct");
+        std::fs::create_dir_all(&direct).unwrap();
+        std::fs::write(direct.join(MODULE_MANIFEST_FILENAME), "{}").unwrap();
+        assert!(dir_has_manifest(&direct), "direct manifest");
+
+        // A manifest two levels below `deep` is NOT a hint for `deep`, but IS a
+        // hint for the intervening `deep/one`.
+        let two_deep = t.join("deep").join("one").join("two");
+        std::fs::create_dir_all(&two_deep).unwrap();
+        std::fs::write(two_deep.join(MODULE_MANIFEST_FILENAME), "{}").unwrap();
+        assert!(!dir_has_manifest(&t.join("deep")), "two levels down is not a hint");
+        assert!(dir_has_manifest(&t.join("deep").join("one")), "one level peek");
+        assert!(dir_has_manifest(&two_deep), "direct at the leaf");
+
+        let empty = t.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(!dir_has_manifest(&empty));
+
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn browser_entries_orders_parent_dirs_files_and_classifies() {
+        let t = scratch("entries");
+        std::fs::create_dir_all(t.join("zeta")).unwrap();
+        std::fs::create_dir_all(t.join("alpha")).unwrap();
+        std::fs::write(t.join("notes.txt"), "x").unwrap();
+        std::fs::write(t.join(MODULE_MANIFEST_FILENAME), "{}").unwrap();
+        std::fs::write(t.join("alpha").join(MODULE_MANIFEST_FILENAME), "{}").unwrap();
+
+        let e = browser_entries(&t);
+        assert_eq!(e[0].kind, BrowserKind::Parent);
+        assert_eq!(e[0].name, "../");
+        assert_eq!(e[1].name, "alpha");
+        assert_eq!(e[1].kind, BrowserKind::ModuleFolder);
+        assert_eq!(e[2].name, "zeta");
+        assert_eq!(e[2].kind, BrowserKind::Other);
+        // Files sort alphabetically: "cockatiel_module_info.json" < "notes.txt".
+        assert_eq!(e[3].name, MODULE_MANIFEST_FILENAME);
+        assert_eq!(e[3].kind, BrowserKind::Manifest);
+        assert_eq!(e[4].name, "notes.txt");
+        assert_eq!(e[4].kind, BrowserKind::Other);
+
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn selecting_an_outside_manifest_confirms_then_offers_move_or_link() {
+        let t = scratch("flow");
+        std::fs::write(t.join(MODULE_MANIFEST_FILENAME), r#"{"name":"mymod"}"#).unwrap();
+
+        let mut w = ModulesWindow::new();
+        w.open_browser(t.clone());
+        let idx = w
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.kind == BrowserKind::Manifest)
+            .unwrap();
+        w.browser.as_mut().unwrap().selected = idx;
+
+        let hk = empty_hotkeys();
+        // Enter on the manifest -> confirm dialog (no action yet).
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(matches!(a, Some(Action::Noop)));
+        assert!(w.browser.as_ref().unwrap().confirm.is_some());
+
+        // The temp dir is outside the standard modules dir, so "yes" escalates
+        // to the move/link choice rather than adopting in place.
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()), &hk);
+        assert!(matches!(a, Some(Action::Noop)));
+        assert!(w.browser.as_ref().unwrap().relink.is_some());
+
+        // "m" resolves to a Move adopt and closes the browser.
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()), &hk);
+        match a {
+            Some(Action::AdoptModule(_, AdoptMode::Move)) => {}
+            other => panic!("expected Move adopt, got {:?}", other),
+        }
+        assert!(w.browser.is_none(), "browser closes on adopt");
+
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn browser_navigation_descends_and_goes_up() {
+        let t = scratch("nav");
+        let sub = t.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut w = ModulesWindow::new();
+        w.open_browser(t.clone());
+        let idx = w
+            .browser
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .position(|e| e.name == "sub")
+            .unwrap();
+        w.browser.as_mut().unwrap().selected = idx;
+
+        let hk = empty_hotkeys();
+        // Enter on a plain directory descends.
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(matches!(a, Some(Action::Noop)));
+        assert_eq!(w.browser.as_ref().unwrap().cwd, sub);
+
+        // Backspace goes back up.
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
+        assert!(matches!(a, Some(Action::Noop)));
+        assert_eq!(w.browser.as_ref().unwrap().cwd, t);
+
+        // Esc closes the browser.
+        let a = w.browser_key_impl(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
+        assert!(matches!(a, Some(Action::Noop)));
+        assert!(w.browser.is_none());
+
+        let _ = std::fs::remove_dir_all(&t);
+    }
 }
