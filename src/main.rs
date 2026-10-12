@@ -2260,19 +2260,30 @@ fn fill_window_action(state: &AppState, window_name: &str, action: Action) -> Ac
 /// When the engine reports a module as connected, promote any "starting" run
 /// status to "connected".
 fn sync_module_runs(state: &mut AppState) {
-    // 1. Promote starting → connected once the engine reports the session.
+    let now = Instant::now();
+
+    // 1. Promote starting → connected once the engine reports the session, and
+    //    record when the engine last saw each connected/starting module.
     {
         let mut runs = state.module_runs.lock().unwrap();
         let mut started = state.module_started_at.lock().unwrap();
+        let mut connected_at = state.module_connected_at.lock().unwrap();
         for entry in &state.stats.module_entries {
             if entry.status == "connected" {
-                if let Some(cur) = runs.get(&entry.name) {
-                    if cur == "starting" {
+                match runs.get(&entry.name).cloned().as_deref() {
+                    Some("starting") => {
                         runs.insert(entry.name.clone(), "connected".to_string());
                         // A successful start clears the startup deadline so a
                         // later restart gets a fresh window.
                         started.remove(&entry.name);
+                        connected_at.insert(entry.name.clone(), now);
                     }
+                    // Record the last-seen-connected time for a module the
+                    // engine still reports (drives the wedged-module check).
+                    Some("connected") => {
+                        connected_at.insert(entry.name.clone(), now);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2292,6 +2303,51 @@ fn sync_module_runs(state: &mut AppState) {
                     _ => {}
                 }
             }
+        }
+    }
+
+    // 3. Wedged-module detection. A module the engine once reported connected
+    //    can stop being reported (the engine's liveness probe dropped its
+    //    session) while its PROCESS stays alive — so `spawn_monitor` never sees
+    //    an exit and nothing recovers it. After STALE_CONNECTED_AFTER without
+    //    the engine reporting it connected, treat it as a crash and hand it to
+    //    the EXISTING crash ladder (backoff + rebuild/rollback, no tight loop).
+    {
+        let mut runs = state.module_runs.lock().unwrap();
+        let mut connected_at = state.module_connected_at.lock().unwrap();
+        let mut stale: Vec<String> = Vec::new();
+        for (name, status) in runs.iter() {
+            if status != "connected" {
+                continue;
+            }
+            let engine_connected = state
+                .stats
+                .module_entries
+                .iter()
+                .any(|e| &e.name == name && e.status == "connected");
+            let last_seen = connected_at.get(name).copied();
+            if should_restart_stale(status, engine_connected, last_seen, now, STALE_CONNECTED_AFTER) {
+                stale.push(name.clone());
+            }
+        }
+        // Apply outside the iteration: mutate `runs`/`connected_at` and log.
+        // A module already being restarted is no longer "connected", so it is
+        // skipped above; without a crash ladder there is nothing to drive.
+        for name in stale {
+            let Some(tx) = state.restart_tx.as_ref() else {
+                break;
+            };
+            runs.insert(name.clone(), "crashed".to_string());
+            connected_at.remove(&name);
+            supervisor_log(
+                state,
+                format!(
+                    "[supervisor] {} stopped responding to the engine ({}s) — restarting via the crash ladder",
+                    name,
+                    STALE_CONNECTED_AFTER.as_secs()
+                ),
+            );
+            let _ = tx.send(name);
         }
     }
 }
@@ -3662,6 +3718,35 @@ const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// This is a DISPLAY state only: the process is not killed, so a module that
 /// eventually connects still promotes to "connected" and clears the failure.
 pub const STARTUP_FAILED_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// How long a module may stay flagged "connected" while the engine STOPS
+/// reporting it connected before the TUI treats it as a crash. This catches a
+/// WEDGED module: the process is still alive (so `spawn_monitor` never sees an
+/// exit) but its loop is blocked and it cannot reconnect, so the engine has
+/// dropped its session. A healthy module reconnects within ~1-2s, so 30s is a
+/// safe margin; on expiry the existing crash ladder restarts it (with backoff,
+/// so there is no tight loop).
+pub const STALE_CONNECTED_AFTER: Duration = Duration::from_secs(30);
+
+/// Decide whether a "connected" module whose engine status has dropped off is
+/// stale enough to restart. Pure so every branch is unit-testable.
+///
+/// True ONLY when the run is still marked `"connected"`, the engine is NOT
+/// currently reporting it connected, we have a recorded last-seen-connected
+/// time, and at least `threshold` has elapsed since then. An absent
+/// `last_seen` (a module whose engine entry vanished before we ever recorded a
+/// connect) returns false, so the first poll never fires.
+fn should_restart_stale(
+    run_status: &str,
+    engine_connected: bool,
+    last_seen: Option<Instant>,
+    now: Instant,
+    threshold: Duration,
+) -> bool {
+    run_status == "connected"
+        && !engine_connected
+        && last_seen.is_some_and(|seen| now.duration_since(seen) >= threshold)
+}
 
 /// Decide whether a module stuck in "starting" has exceeded its startup
 /// window, and what failure status to show. Pure so it is unit-testable: a
@@ -5562,5 +5647,95 @@ mod startup_failed_tests {
     #[test]
     fn never_started_is_not_a_failure() {
         assert_eq!(startup_failed_status(None, ""), None);
+    }
+}
+
+#[cfg(test)]
+mod stale_connected_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A stale "connected" run the engine has stopped reporting fires.
+    #[test]
+    fn stale_connected_fires() {
+        let now = Instant::now();
+        let last_seen = now - (STALE_CONNECTED_AFTER + Duration::from_secs(1));
+        assert!(should_restart_stale(
+            "connected",
+            false,
+            Some(last_seen),
+            now,
+            STALE_CONNECTED_AFTER,
+        ));
+    }
+
+    /// Exactly at the threshold counts as stale (`>=`).
+    #[test]
+    fn exactly_at_threshold_fires() {
+        let now = Instant::now();
+        let last_seen = now - STALE_CONNECTED_AFTER;
+        assert!(should_restart_stale(
+            "connected",
+            false,
+            Some(last_seen),
+            now,
+            STALE_CONNECTED_AFTER,
+        ));
+    }
+
+    /// Still within the window does not fire (the module may just be reconnecting).
+    #[test]
+    fn within_threshold_does_not_fire() {
+        let now = Instant::now();
+        let last_seen = now - (STALE_CONNECTED_AFTER - Duration::from_secs(1));
+        assert!(!should_restart_stale(
+            "connected",
+            false,
+            Some(last_seen),
+            now,
+            STALE_CONNECTED_AFTER,
+        ));
+    }
+
+    /// A module the engine still reports connected is healthy, however long.
+    #[test]
+    fn engine_connected_does_not_fire() {
+        let now = Instant::now();
+        let last_seen = now - (STALE_CONNECTED_AFTER * 10);
+        assert!(!should_restart_stale(
+            "connected",
+            true,
+            Some(last_seen),
+            now,
+            STALE_CONNECTED_AFTER,
+        ));
+    }
+
+    /// Missing last-seen (entry vanished before we ever recorded a connect)
+    /// never fires on the first poll.
+    #[test]
+    fn missing_last_seen_does_not_fire() {
+        let now = Instant::now();
+        assert!(!should_restart_stale(
+            "connected",
+            false,
+            None,
+            now,
+            STALE_CONNECTED_AFTER,
+        ));
+    }
+
+    /// Every non-"connected" run status is out of scope: starting is handled by
+    /// STARTUP_FAILED_AFTER, and the rest are already in the crash ladder.
+    #[test]
+    fn other_run_statuses_never_fire() {
+        let now = Instant::now();
+        let last_seen = now - (STALE_CONNECTED_AFTER + Duration::from_secs(1));
+        for status in ["starting", "stopped", "crashed", "restarting", "building"] {
+            assert!(
+                !should_restart_stale(status, false, Some(last_seen), now, STALE_CONNECTED_AFTER),
+                "{status} must never fire the stale check"
+            );
+        }
     }
 }

@@ -357,6 +357,12 @@ pub struct AppState {
     /// engine ever reporting it connected — is surfaced as a terminal
     /// "startup failed" instead of an eternal spinner.
     pub module_started_at: Arc<Mutex<HashMap<String, Instant>>>,
+    /// When the engine last reported each module "connected" (module ->
+    /// Instant). A connected module whose engine status drops off while the
+    /// process stays alive is WEDGED — the process monitor never sees an exit,
+    /// so this clock is what lets `sync_module_runs` hand it to the crash
+    /// ladder after [`crate::main::STALE_CONNECTED_AFTER`].
+    pub module_connected_at: Arc<Mutex<HashMap<String, Instant>>>,
     /// The last error line each module emitted, kept so a "startup failed"
     /// status can explain WHY (the reason a user can act on, instead of
     /// "starting" forever).
@@ -439,6 +445,7 @@ impl AppState {
             module_logs: Arc::new(Mutex::new(VecDeque::new())),
             module_errors: Arc::new(Mutex::new(HashMap::new())),
             module_started_at: Arc::new(Mutex::new(HashMap::new())),
+            module_connected_at: Arc::new(Mutex::new(HashMap::new())),
             module_last_error: Arc::new(Mutex::new(HashMap::new())),
         }
     }
