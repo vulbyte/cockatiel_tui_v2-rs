@@ -539,6 +539,39 @@ pub fn modules_registry_path() -> PathBuf {
     engine_dir().join("modules.json")
 }
 
+/// The engine's transient "removed modules" file: a JSON array of module names
+/// the operator deleted. The engine excludes these names from `module_list`
+/// until the module reconnects (or the engine restarts), so the suppression is
+/// never permanent.
+pub fn removed_modules_path() -> PathBuf {
+    engine_dir().join("removed_modules.json")
+}
+
+/// Record `name` in the engine's removed-modules file so the engine drops it
+/// from `module_list` NOW. Merges with any names a concurrent delete (or the
+/// engine) already recorded, so a delete never clobbers a peer's, and writes
+/// atomically. Best-effort: the caller logs a failure but the kill + config
+/// edits already happened.
+pub fn add_removed_module(name: &str) -> std::io::Result<()> {
+    add_removed_module_at(&removed_modules_path(), name)
+}
+
+/// [`add_removed_module`] parameterized on the file path so unit tests can point
+/// it at a temp file instead of the live engine directory.
+fn add_removed_module_at(path: &Path, name: &str) -> std::io::Result<()> {
+    let mut names: Vec<String> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    if names.iter().any(|n| n == name) {
+        return Ok(());
+    }
+    names.push(name.to_string());
+    names.sort();
+    let json = serde_json::to_string_pretty(&names).unwrap_or_else(|_| "[]".to_string());
+    write_atomic_0600(path, &json)
+}
+
 /// Read the engine's modules.json and return the registered identity
 /// (instance_uuid7, auth_token) for a module name. A fresh TUI/control-surface
 /// process loads its own identity here so it can reconnect to a warm engine via
@@ -3608,6 +3641,36 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {:?}", leftovers.len());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A delete records the module name in the engine's removed-modules file so
+    /// the engine drops it from `module_list` — but it must MERGE, because a
+    /// second delete (or the engine clearing one name) can touch the same file.
+    /// The file stays a JSON array either way.
+    #[test]
+    fn add_removed_module_merges_names_and_stays_an_array() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-rmmod-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("removed_modules.json");
+
+        // First delete creates the file.
+        add_removed_module_at(&path, "clip").unwrap();
+        let names: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(names, vec!["clip".to_string()]);
+
+        // A second delete must not clobber the first.
+        add_removed_module_at(&path, "tts-rs").unwrap();
+        let names: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(names, vec!["clip".to_string(), "tts-rs".to_string()]);
+
+        // Re-deleting the same module is idempotent.
+        add_removed_module_at(&path, "clip").unwrap();
+        let names: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(names.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

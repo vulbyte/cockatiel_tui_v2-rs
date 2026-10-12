@@ -2631,6 +2631,17 @@ fn delete_module(state: &mut AppState, supervisor: &mut supervisor::ProcessTable
             }
         }
     }
+    // Tell the engine to drop the module from `module_list` NOW — the engine
+    // lists modules DISCOVERED on disk, so without this the row reappears on the
+    // next poll. Transient: the engine clears the name when the module
+    // reconnects and the whole file at startup, so a restarted/reconnected
+    // module comes back (the folder is left in place). Best-effort.
+    if let Err(e) = supervisor::add_removed_module(name) {
+        supervisor_log(
+            state,
+            format!("[supervisor] could not record {} as removed: {}", name, e),
+        );
+    }
     supervisor_log(state, format!("[supervisor] deleted {}", name));
 }
 
@@ -3231,7 +3242,7 @@ async fn dispatch_action(
                 let prompt = cockatiel_client::proto::Prompt {
                     prompt_id_uuid7: prompt_id,
                     prompt: format!("Delete {}?", name),
-                    details: "This KILLS the module process and REMOVES it from modules.json + the engine's config.json ordering. The module will no longer be known to Cockatiel (you'd have to re-add it).".to_string(),
+                    details: "This KILLS the module process and removes it from modules.json + the engine's config.json ordering, and hides it from the engine now. It is NOT permanent: the module folder is left in place, and the module will reappear if it reconnects or the engine/stack restarts (a restart re-discovers every module).".to_string(),
                     yes_dialog: "Yes — delete module".to_string(),
                     no_dialog: "Cancel".to_string(),
                     timeout: 60,
