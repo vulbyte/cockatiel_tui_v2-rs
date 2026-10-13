@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::fuzzy::fuzzy_subsequence;
 use crate::plugins::Plugin;
 use crate::windows::modules::StageDirection;
 
@@ -1392,42 +1393,6 @@ fn fallback_to_terminal_app(run: &str) -> Result<(), String> {
     cmd.spawn()
         .map(|_| ())
         .map_err(|e| format!("failed to open the system terminal: {}", e))
-}
-
-/// Fuzzy match a query against a candidate: `query` must appear as a
-/// case-insensitive subsequence of `candidate`. E.g. "iterm" matches
-/// "iTerm.app", "wez" matches "WezTerm.app". Returns the match score
-/// (0 = no match, higher = better), biased toward fewer skipped characters.
-fn fuzzy_subsequence(query: &str, candidate: &str) -> usize {
-    let q: Vec<char> = query.trim().chars().filter(|c| !c.is_whitespace()).collect();
-    let c: Vec<char> = candidate.chars().collect();
-    if q.is_empty() {
-        return 0;
-    }
-    let mut qi = 0;
-    let mut skipped = 0usize;
-    for ch in &c {
-        if qi < q.len() && ch.eq_ignore_ascii_case(&q[qi]) {
-            qi += 1;
-        } else if qi > 0 {
-            skipped += 1;
-        }
-    }
-    if qi != q.len() {
-        return 0;
-    }
-    // Fewer trailing skipped chars = a better match. Exact (case-insensitive)
-    // prefix matches score highest.
-    let exact_prefix = c
-        .iter()
-        .take(q.len())
-        .zip(q.iter())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b));
-    if exact_prefix {
-        1000 - skipped
-    } else {
-        500 - skipped
-    }
 }
 
 /// The directories a macOS app can live in, searched in order for
@@ -3971,20 +3936,6 @@ mod tests {
         eprintln!("CRT partial: {:?}", r3);
         let r4 = macos_resolve_terminal_emulator("cool", None);
         eprintln!("CRT 'cool': {:?}", r4);
-    }
-
-    #[test]
-    fn fuzzy_subsequence_matches_names_partially() {
-        // Exact-ish matches score highest.
-        assert!(fuzzy_subsequence("iterm", "iTerm") > fuzzy_subsequence("iterm", "iTermSomethingElse"));
-        // Case-insensitive subsequence.
-        assert_eq!(fuzzy_subsequence("iterm", "iTerm"), 1000 - 0);
-        assert!(fuzzy_subsequence("wez", "WezTerm") > 0);
-        assert!(fuzzy_subsequence("alacr", "Alacritty") > 0);
-        // No match -> 0.
-        assert_eq!(fuzzy_subsequence("zzz", "Terminal"), 0);
-        // Empty query -> 0.
-        assert_eq!(fuzzy_subsequence("", "Terminal"), 0);
     }
 
     #[test]

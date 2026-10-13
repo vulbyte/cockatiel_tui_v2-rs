@@ -2,6 +2,7 @@ mod app;
 mod bsp;
 mod colors;
 mod db;
+mod fuzzy;
 mod rank_chart;
 mod event;
 mod hotkeys;
@@ -447,6 +448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "chart" => crate::bsp::ViewType::EngineGraph,
             "prompts" => crate::bsp::ViewType::Prompts,
             "users" => crate::bsp::ViewType::TopUsers,
+            "user_management" => crate::bsp::ViewType::UserManagement,
             _ => crate::bsp::ViewType::CockatielInfo,
         };
         state.tree = crate::bsp::single_tree(view);

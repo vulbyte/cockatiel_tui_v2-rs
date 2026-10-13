@@ -47,6 +47,7 @@ pub enum ViewType {
     Prompts,
     TopUsers,
     StreamManager,
+    UserManagement,
 }
 
 impl ViewType {
@@ -59,6 +60,7 @@ impl ViewType {
             ViewType::Prompts,
             ViewType::TopUsers,
             ViewType::StreamManager,
+            ViewType::UserManagement,
         ]
     }
 
@@ -71,6 +73,7 @@ impl ViewType {
             ViewType::Prompts => "prompts",
             ViewType::TopUsers => "top_users",
             ViewType::StreamManager => "stream_manager",
+            ViewType::UserManagement => "user_management",
         }
     }
 
@@ -88,6 +91,7 @@ impl ViewType {
             ViewType::Prompts => WindowId::Prompts,
             ViewType::TopUsers => WindowId::Users,
             ViewType::StreamManager => WindowId::StreamManager,
+            ViewType::UserManagement => WindowId::UserManagement,
         }
     }
 }
@@ -341,7 +345,7 @@ fn split(axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node>) -> Box<Node> {
 pub fn make_window(view: ViewType) -> Box<dyn Window> {
     use crate::windows::{
         ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, StreamManagerWindow,
-        UsersWindow,
+        UserManagementWindow, UsersWindow,
     };
     match view {
         ViewType::CockatielInfo => Box::new(LogoWindow),
@@ -351,6 +355,7 @@ pub fn make_window(view: ViewType) -> Box<dyn Window> {
         ViewType::Prompts => Box::new(PromptsWindow::new()),
         ViewType::TopUsers => Box::new(UsersWindow::new()),
         ViewType::StreamManager => Box::new(StreamManagerWindow::new()),
+        ViewType::UserManagement => Box::new(UserManagementWindow::new()),
     }
 }
 

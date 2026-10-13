@@ -50,6 +50,10 @@ pub enum WindowId {
     /// Stream manager: schedule/update a stream's title, start time and
     /// thumbnail. Writes `stream_control`; the adapters poll `stream_schedule`.
     StreamManager,
+    /// Detached user-management view: fuzzy search + per-user action menu
+    /// (reprimand / commendation / score adjust / link account). Like `Users`,
+    /// NOT part of the embedded window cycle.
+    UserManagement,
 }
 
 impl WindowId {
@@ -62,6 +66,7 @@ impl WindowId {
             WindowId::Prompts => "prompts",
             WindowId::Users => "users",
             WindowId::StreamManager => "stream_manager",
+            WindowId::UserManagement => "user_management",
         }
     }
 
@@ -74,6 +79,7 @@ impl WindowId {
             WindowId::Prompts => "prompts",
             WindowId::Users => "user database",
             WindowId::StreamManager => "stream manager",
+            WindowId::UserManagement => "user management",
         }
     }
 }

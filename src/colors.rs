@@ -101,6 +101,7 @@ pub fn default_colors() -> ColorConfig {
     borders.insert("prompts".to_string(), Color::Magenta);
     borders.insert("users".to_string(), Color::LightCyan);
     borders.insert("stream_manager".to_string(), Color::LightGreen);
+    borders.insert("user_management".to_string(), Color::LightMagenta);
 
     let mut status = HashMap::new();
     status.insert("online".to_string(), Color::Green);
