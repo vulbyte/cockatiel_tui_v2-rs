@@ -48,12 +48,22 @@ pub struct UserManagementWindow {
     /// delta)`. A row displays `base + delta` until the polled score moves off
     /// `base`, at which point the entry is reconciled away.
     optimistic: HashMap<String, (i32, i32)>,
+    /// The selected user's linked channels (raw `"platform:channel_id (handle)"`
+    /// strings), captured in [`UserManagementWindow::open_menu`] because the
+    /// dialog-key path cannot reach `stats`. Drives the channels sub-menu.
+    menu_channels: Vec<String>,
+    /// The selected user's roles `(sponsor, moderator, admin, owner)`, captured
+    /// in [`UserManagementWindow::open_menu`]. The permissions sub-menu keeps
+    /// sponsor/owner and rewrites moderator/admin.
+    menu_roles: (bool, bool, bool, bool),
 }
 
 /// The user-management modal. The `Menu` lists the per-user actions; the
 /// `AdjustScore` arm is the small signed-integer editor opened by `s`; the two
 /// `Link*` arms are the account-merge flow opened by `l` (pick a partner, then
-/// confirm the merge).
+/// confirm the merge). The `ChannelPick`/`ChannelAction` arms are the channels
+/// flow opened by `h` (pick a linked channel, then remove/split it); the
+/// `Permissions` arm is the promote/demote sub-menu opened by `p`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UserDialog {
     Menu {
@@ -67,6 +77,45 @@ enum UserDialog {
     },
     LinkPick(LinkPickState),
     LinkConfirm(LinkConfirmState),
+    ChannelPick(ChannelPickState),
+    ChannelAction(ChannelActionState),
+    Permissions(PermissionsState),
+}
+
+/// The channels sub-menu (opened by `h`): the selected user's linked platform
+/// accounts. Selecting one opens [`ChannelActionState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelPickState {
+    uuid7: String,
+    username: String,
+    /// Raw `"platform:channel_id (handle)"` strings, captured when the menu
+    /// opened (the dialog-key path cannot reach `stats`).
+    channels: Vec<String>,
+    /// Index into `channels`.
+    selected: usize,
+}
+
+/// The remove/split sub-menu for one linked channel. `selected` is `0` for
+/// remove and `1` for split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelActionState {
+    uuid7: String,
+    username: String,
+    /// Raw `"platform:channel_id (handle)"` string.
+    channel: String,
+    selected: usize,
+}
+
+/// The promote/demote sub-menu (opened by `p`). Sponsor/owner are captured from
+/// the selected user and preserved; moderator/admin are rewritten by the choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionsState {
+    uuid7: String,
+    username: String,
+    is_sponsor: bool,
+    is_owner: bool,
+    /// `0` = promote mod, `1` = promote admin, `2` = demote.
+    selected: usize,
 }
 
 /// Step 1 of the link/merge flow: a fuzzy search field plus the list of OTHER
@@ -283,6 +332,8 @@ impl UserManagementWindow {
             link_source_merged: false,
             menu_base: None,
             optimistic: HashMap::new(),
+            menu_channels: Vec::new(),
+            menu_roles: (false, false, false, false),
         }
     }
 
@@ -338,6 +389,15 @@ impl UserManagementWindow {
             .cloned()
             .collect();
         self.link_source_merged = is_merged(user);
+        // Capture the channels and roles now: the dialog-key path cannot reach
+        // `stats`, and the channels/permissions sub-menus are built from them.
+        self.menu_channels = user.channels.clone();
+        self.menu_roles = (
+            user.is_sponsor,
+            user.is_moderator,
+            user.is_admin,
+            user.is_owner,
+        );
         // Capture the base score so a later adjustment can be shown instantly;
         // the dialog-key path has no access to `stats`.
         self.menu_base = Some((user.uuid7.clone(), user.score));
@@ -432,6 +492,30 @@ impl UserManagementWindow {
                     }));
                     Some(Action::Noop)
                 }
+                KeyCode::Char('h') => {
+                    // Channels: pick a linked account, then remove/split it.
+                    self.status = None;
+                    self.dialog = Some(UserDialog::ChannelPick(ChannelPickState {
+                        uuid7,
+                        username,
+                        channels: self.menu_channels.clone(),
+                        selected: 0,
+                    }));
+                    Some(Action::Noop)
+                }
+                KeyCode::Char('p') => {
+                    // Permissions: promote to mod/admin or demote.
+                    self.status = None;
+                    let (is_sponsor, _mod, _admin, is_owner) = self.menu_roles;
+                    self.dialog = Some(UserDialog::Permissions(PermissionsState {
+                        uuid7,
+                        username,
+                        is_sponsor,
+                        is_owner,
+                        selected: 0,
+                    }));
+                    Some(Action::Noop)
+                }
                 _ => {
                     self.dialog = Some(UserDialog::Menu { uuid7, username });
                     Some(Action::Noop)
@@ -494,6 +578,9 @@ impl UserManagementWindow {
             },
             UserDialog::LinkPick(pick) => self.link_pick_key(pick, key),
             UserDialog::LinkConfirm(confirm) => self.link_confirm_key(confirm, key),
+            UserDialog::ChannelPick(pick) => self.channel_pick_key(pick, key),
+            UserDialog::ChannelAction(action) => self.channel_action_key(action, key),
+            UserDialog::Permissions(perm) => self.permissions_key(perm, key),
         }
     }
 
@@ -693,6 +780,161 @@ impl UserManagementWindow {
         ))
     }
 
+    /// Resolve a key while the channels picker is open. Esc returns to the
+    /// action menu, Enter opens the remove/split sub-menu for the highlighted
+    /// channel, and arrows/`j`/`k` move.
+    fn channel_pick_key(&mut self, mut pick: ChannelPickState, key: KeyEvent) -> Option<Action> {
+        let len = pick.channels.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog = Some(UserDialog::Menu {
+                    uuid7: pick.uuid7,
+                    username: pick.username,
+                });
+                Some(Action::Noop)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                pick.selected = (pick.selected + 1).min(len.saturating_sub(1));
+                self.dialog = Some(UserDialog::ChannelPick(pick));
+                Some(Action::Noop)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                pick.selected = pick.selected.saturating_sub(1);
+                self.dialog = Some(UserDialog::ChannelPick(pick));
+                Some(Action::Noop)
+            }
+            KeyCode::Enter => {
+                if let Some(channel) = pick.channels.get(pick.selected).cloned() {
+                    self.dialog = Some(UserDialog::ChannelAction(ChannelActionState {
+                        uuid7: pick.uuid7,
+                        username: pick.username,
+                        channel,
+                        selected: 0,
+                    }));
+                } else {
+                    self.dialog = Some(UserDialog::ChannelPick(pick));
+                }
+                Some(Action::Noop)
+            }
+            _ => {
+                self.dialog = Some(UserDialog::ChannelPick(pick));
+                Some(Action::Noop)
+            }
+        }
+    }
+
+    /// Resolve a key while the channel remove/split sub-menu is open. Enter
+    /// emits the query; Esc returns to the channels picker.
+    fn channel_action_key(
+        &mut self,
+        mut state: ChannelActionState,
+        key: KeyEvent,
+    ) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog = Some(UserDialog::ChannelPick(ChannelPickState {
+                    uuid7: state.uuid7,
+                    username: state.username,
+                    channels: self.menu_channels.clone(),
+                    selected: 0,
+                }));
+                Some(Action::Noop)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.selected = (state.selected + 1).min(1);
+                self.dialog = Some(UserDialog::ChannelAction(state));
+                Some(Action::Noop)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.selected = state.selected.saturating_sub(1);
+                self.dialog = Some(UserDialog::ChannelAction(state));
+                Some(Action::Noop)
+            }
+            KeyCode::Enter => self.confirm_channel_action(state),
+            _ => {
+                self.dialog = Some(UserDialog::ChannelAction(state));
+                Some(Action::Noop)
+            }
+        }
+    }
+
+    /// Emit the remove or split query for the chosen channel. Mirrors the other
+    /// actions: the menu closes and a status line reports what was sent.
+    fn confirm_channel_action(&mut self, state: ChannelActionState) -> Option<Action> {
+        let (platform, channel_id, handle) = parse_channel_string(&state.channel);
+        let label = channel_label(&state.channel);
+        if state.selected == 1 {
+            self.status = Some(format!("splitting {} from {}", label, state.username));
+            Some(split_channel_query(
+                &state.uuid7,
+                &platform,
+                &channel_id,
+                &handle,
+            ))
+        } else {
+            self.status = Some(format!("removed {} from {}", label, state.username));
+            Some(remove_channel_query(&state.uuid7, &platform, &channel_id))
+        }
+    }
+
+    /// Resolve a key while the permissions sub-menu is open. Enter (or `1`/`2`/
+    /// `3`) applies the choice; Esc returns to the action menu.
+    fn permissions_key(&mut self, mut state: PermissionsState, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog = Some(UserDialog::Menu {
+                    uuid7: state.uuid7,
+                    username: state.username,
+                });
+                Some(Action::Noop)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.selected = (state.selected + 1).min(2);
+                self.dialog = Some(UserDialog::Permissions(state));
+                Some(Action::Noop)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.selected = state.selected.saturating_sub(1);
+                self.dialog = Some(UserDialog::Permissions(state));
+                Some(Action::Noop)
+            }
+            KeyCode::Char('1') => self.apply_permissions(state, 0),
+            KeyCode::Char('2') => self.apply_permissions(state, 1),
+            KeyCode::Char('3') => self.apply_permissions(state, 2),
+            KeyCode::Enter => {
+                let selected = state.selected;
+                self.apply_permissions(state, selected)
+            }
+            _ => {
+                self.dialog = Some(UserDialog::Permissions(state));
+                Some(Action::Noop)
+            }
+        }
+    }
+
+    /// Emit the `userdb_set_roles` query for the chosen permission level,
+    /// preserving the target's sponsor/owner flags. `0` = mod, `1` = admin,
+    /// `2` = demote (clear mod + admin).
+    fn apply_permissions(&mut self, state: PermissionsState, choice: usize) -> Option<Action> {
+        let (is_moderator, is_admin) = match choice {
+            0 => (true, false),
+            1 => (false, true),
+            _ => (false, false),
+        };
+        self.status = Some(match choice {
+            0 => format!("{} promoted to moderator", state.username),
+            1 => format!("{} promoted to admin", state.username),
+            _ => format!("{} demoted (mod + admin cleared)", state.username),
+        });
+        Some(set_roles_query(
+            &state.uuid7,
+            state.is_sponsor,
+            is_moderator,
+            is_admin,
+            state.is_owner,
+        ))
+    }
+
     // ── rendering ───────────────────────────────────────────────────
 
     fn render_rows(&mut self, area: Rect, buf: &mut Buffer, list: &[&UserSummary]) {
@@ -833,6 +1075,72 @@ pub(crate) fn merge_query(
     Action::UserQuery(MERGE_QUERY_ID.to_string(), payload.to_string())
 }
 
+/// The engine virtual query that removes one linked channel from a user (the
+/// channels sub-menu's remove action).
+pub(crate) const REMOVE_CHANNEL_QUERY_ID: &str = "userdb_remove_channel";
+
+/// Build the one-shot remove-channel query.
+pub(crate) fn remove_channel_query(uuid7: &str, platform: &str, channel_id: &str) -> Action {
+    let payload = serde_json::json!({
+        "uuid7": uuid7,
+        "platform": platform,
+        "channel_id": channel_id,
+    });
+    Action::UserQuery(REMOVE_CHANNEL_QUERY_ID.to_string(), payload.to_string())
+}
+
+/// The engine virtual query that detaches one linked channel from a user AND
+/// creates a new account for it (the channels sub-menu's split action).
+pub(crate) const SPLIT_CHANNEL_QUERY_ID: &str = "userdb_split_channel";
+
+/// Build the one-shot split-channel query. The engine uses `handle` as the new
+/// account's username (falling back to `channel_id` when it is empty).
+pub(crate) fn split_channel_query(
+    uuid7: &str,
+    platform: &str,
+    channel_id: &str,
+    handle: &str,
+) -> Action {
+    let payload = serde_json::json!({
+        "uuid7": uuid7,
+        "platform": platform,
+        "channel_id": channel_id,
+        "handle": handle,
+    });
+    Action::UserQuery(SPLIT_CHANNEL_QUERY_ID.to_string(), payload.to_string())
+}
+
+/// The engine virtual query that rewrites a user's roles.
+pub(crate) const SET_ROLES_QUERY_ID: &str = "userdb_set_roles";
+
+/// The TUI's own actor identity for privileged userdb mutations. The engine
+/// collapses a loopback TUI connection to `owner` regardless and the user-db
+/// only checks `actor_role` (owner/admin), so this is informational — but it is
+/// kept non-empty so the payload names a real actor.
+pub(crate) const TUI_ACTOR_UUID7: &str = "cockatiel-tui";
+pub(crate) const TUI_ACTOR_ROLE: &str = "owner";
+
+/// Build the one-shot role-change query. `is_moderator`/`is_admin` are set by
+/// the operator's choice; `is_sponsor`/`is_owner` are preserved from the target.
+pub(crate) fn set_roles_query(
+    uuid7: &str,
+    is_sponsor: bool,
+    is_moderator: bool,
+    is_admin: bool,
+    is_owner: bool,
+) -> Action {
+    let payload = serde_json::json!({
+        "uuid7": uuid7,
+        "actor_uuid7": TUI_ACTOR_UUID7,
+        "actor_role": TUI_ACTOR_ROLE,
+        "is_sponsor": is_sponsor,
+        "is_moderator": is_moderator,
+        "is_admin": is_admin,
+        "is_owner": is_owner,
+    });
+    Action::UserQuery(SET_ROLES_QUERY_ID.to_string(), payload.to_string())
+}
+
 /// Whether an account is already merged (more than one channel). Used to decide
 /// whether the link flow shows the 3-option prompt.
 pub(crate) fn is_merged(user: &UserSummary) -> bool {
@@ -954,15 +1262,47 @@ pub(crate) fn display_name(user: &UserSummary) -> String {
     }
 }
 
+/// Parse a stored channel string (`"platform:channel_id (handle)"`) back into
+/// `(platform, channel_id, handle)`. Deliberately lenient: a missing `(...)`
+/// group yields an empty handle, a missing `:` yields an empty `channel_id`,
+/// and surrounding whitespace is ignored. `handle` may legitimately be empty
+/// (`"platform:channel_id ()"`).
+pub(crate) fn parse_channel_string(channel: &str) -> (String, String, String) {
+    // The handle is the contents of the LAST parenthesised group, if any.
+    let (head, handle) = match channel.rsplit_once('(') {
+        Some((head, rest)) => {
+            let handle = rest.strip_suffix(')').unwrap_or(rest).trim().to_string();
+            (head, handle)
+        }
+        None => (channel, String::new()),
+    };
+    let head = head.trim_end();
+    match head.split_once(':') {
+        Some((platform, channel_id)) => (
+            platform.trim().to_string(),
+            channel_id.trim().to_string(),
+            handle,
+        ),
+        None => (head.trim().to_string(), String::new(), handle),
+    }
+}
+
+/// The sub-menu label for a channel: `<platform>:<handle>`, falling back to the
+/// channel_id when the handle is empty.
+pub(crate) fn channel_label(channel: &str) -> String {
+    let (platform, channel_id, handle) = parse_channel_string(channel);
+    let name = if handle.is_empty() {
+        channel_id
+    } else {
+        handle
+    };
+    format!("{}:{}", platform, name)
+}
+
 /// Split a stored channel string (`"platform:channel_id (handle)"`) into its
 /// platform and handle.
 fn split_channel(channel: &str) -> (String, String) {
-    let platform = channel.split(':').next().unwrap_or("").to_string();
-    let handle = channel
-        .rsplit_once('(')
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .unwrap_or("")
-        .to_string();
+    let (platform, _channel_id, handle) = parse_channel_string(channel);
     (platform, handle)
 }
 
@@ -997,6 +1337,9 @@ fn render_dialog(
     match dialog {
         UserDialog::LinkPick(pick) => render_link_pick(pick, candidates, area, buf, colors),
         UserDialog::LinkConfirm(confirm) => render_link_confirm(confirm, area, buf, colors),
+        UserDialog::ChannelPick(pick) => render_channel_pick(pick, area, buf, colors),
+        UserDialog::ChannelAction(action) => render_channel_action(action, area, buf, colors),
+        UserDialog::Permissions(perm) => render_permissions(perm, area, buf, colors),
         UserDialog::Menu { .. } | UserDialog::AdjustScore { .. } => {
             let bold = Style::default()
                 .fg(Color::White)
@@ -1021,6 +1364,14 @@ fn render_dialog(
                         ),
                         (
                             " [l] link account (merge)".to_string(),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        (
+                            " [h] channels (remove/split)".to_string(),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        (
+                            " [p] permissions (mod/admin)".to_string(),
                             Style::default().fg(Color::Cyan),
                         ),
                         (String::new(), Style::default()),
@@ -1285,6 +1636,120 @@ fn render_link_confirm(
     draw_modal(" confirm merge ", &lines, area, buf, colors, 72);
 }
 
+/// The channels picker overlay (opened by `h`): every linked account of the
+/// selected user, labelled `<platform>:<handle>` (falling back to the
+/// channel_id).
+fn render_channel_pick(
+    pick: &ChannelPickState,
+    area: Rect,
+    buf: &mut Buffer,
+    colors: &ColorConfig,
+) {
+    let bold = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    lines.push((format!(" Channels for {}:", pick.username), bold));
+    lines.push((String::new(), Style::default()));
+    if pick.channels.is_empty() {
+        lines.push((
+            "  (no linked channels)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for (i, channel) in pick.channels.iter().enumerate() {
+            let selected = i == pick.selected;
+            let style = if selected {
+                row_style(true)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push((format!("  {}", channel_label(channel)), style));
+        }
+    }
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        " up/down pick   enter select   esc back".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    draw_modal(" channels ", &lines, area, buf, colors, 60);
+}
+
+/// The remove/split overlay for one linked channel: two options, `remove` and
+/// `split`. Enter applies the highlighted one.
+fn render_channel_action(
+    action: &ChannelActionState,
+    area: Rect,
+    buf: &mut Buffer,
+    colors: &ColorConfig,
+) {
+    let bold = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let mark = |i: usize| if action.selected == i { "▸" } else { " " };
+    let opt_style = |i: usize| {
+        if action.selected == i {
+            row_style(true)
+        } else {
+            normal
+        }
+    };
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    lines.push((format!(" Channel {}", channel_label(&action.channel)), bold));
+    lines.push((format!(" Linked to {}", action.username), bold));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        format!("{} [remove] unlink from {}", mark(0), action.username),
+        opt_style(0),
+    ));
+    lines.push((
+        format!("{} [split] move to a new account", mark(1)),
+        opt_style(1),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        " up/down pick   enter apply   esc back".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    draw_modal(" channel ", &lines, area, buf, colors, 60);
+}
+
+/// The permissions overlay (opened by `p`): promote to mod, promote to admin,
+/// or demote (clear mod + admin). Sponsor/owner are preserved.
+fn render_permissions(perm: &PermissionsState, area: Rect, buf: &mut Buffer, colors: &ColorConfig) {
+    let bold = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let mark = |i: usize| if perm.selected == i { "▸" } else { " " };
+    let opt_style = |i: usize| {
+        if perm.selected == i {
+            row_style(true)
+        } else {
+            normal
+        }
+    };
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    lines.push((format!(" Permissions for {}:", perm.username), bold));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        format!("{} [1] promote to moderator", mark(0)),
+        opt_style(0),
+    ));
+    lines.push((format!("{} [2] promote to admin", mark(1)), opt_style(1)));
+    lines.push((
+        format!("{} [3] demote (clear mod + admin)", mark(2)),
+        opt_style(2),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        " up/down pick   1/2/3 choose   enter apply   esc back".to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    draw_modal(" permissions ", &lines, area, buf, colors, 60);
+}
+
 impl Window for UserManagementWindow {
     fn render(
         &mut self,
@@ -1322,7 +1787,7 @@ impl Window for UserManagementWindow {
         });
 
         let hints = match &self.dialog {
-            Some(UserDialog::Menu { .. }) => "menu:[r|c|s|l]  cancel:[esc]".to_string(),
+            Some(UserDialog::Menu { .. }) => "menu:[r|c|s|l|h|p]  cancel:[esc]".to_string(),
             Some(UserDialog::AdjustScore { .. }) => {
                 "type a signed integer  apply:[enter]  cancel:[esc]".to_string()
             }
@@ -1331,6 +1796,15 @@ impl Window for UserManagementWindow {
             }
             Some(UserDialog::LinkConfirm(_)) => {
                 "focus:[tab]  toggle:[space]  merge:[enter]  back:[esc]".to_string()
+            }
+            Some(UserDialog::ChannelPick(_)) => {
+                "pick:[up|down]  select:[enter]  back:[esc]".to_string()
+            }
+            Some(UserDialog::ChannelAction(_)) => {
+                "pick:[up|down]  apply:[enter]  back:[esc]".to_string()
+            }
+            Some(UserDialog::Permissions(_)) => {
+                "pick:[up|down|1|2|3]  apply:[enter]  back:[esc]".to_string()
             }
             None => "nav:[j|k|g|G]  search:[/]  select:[enter]  quit:[q|esc]".to_string(),
         };
@@ -2131,5 +2605,262 @@ mod tests {
             "option 3 missing:\n{}",
             all
         );
+    }
+
+    #[test]
+    fn parse_channel_string_is_lenient() {
+        assert_eq!(
+            parse_channel_string("twitch:1 (alice_tv)"),
+            (
+                "twitch".to_string(),
+                "1".to_string(),
+                "alice_tv".to_string()
+            )
+        );
+        // An empty handle is legitimate (`"platform:channel_id ()"`).
+        assert_eq!(
+            parse_channel_string("twitch:1 ()"),
+            ("twitch".to_string(), "1".to_string(), "".to_string())
+        );
+        // No parenthesised handle at all.
+        assert_eq!(
+            parse_channel_string("youtube:abc"),
+            ("youtube".to_string(), "abc".to_string(), "".to_string())
+        );
+        // No colon: everything is treated as the platform, leniently.
+        assert_eq!(
+            parse_channel_string("weird"),
+            ("weird".to_string(), "".to_string(), "".to_string())
+        );
+        // A channel_id may itself contain a colon.
+        assert_eq!(
+            parse_channel_string("kick:a:b (h)"),
+            ("kick".to_string(), "a:b".to_string(), "h".to_string())
+        );
+        // The label falls back to the channel_id when the handle is empty.
+        assert_eq!(channel_label("twitch:1 ()"), "twitch:1");
+        assert_eq!(channel_label("twitch:1 (alice_tv)"), "twitch:alice_tv");
+    }
+
+    #[test]
+    fn channel_submenu_emits_remove_and_split() {
+        let mut w = UserManagementWindow::new();
+        w.menu_channels = vec!["twitch:1 (alice_tv)".to_string()];
+        w.dialog = Some(UserDialog::Menu {
+            uuid7: "u1".to_string(),
+            username: "alice".to_string(),
+        });
+
+        // `h` opens the channel picker with the captured channels.
+        assert_eq!(w.dialog_key(key('h')), Some(Action::Noop));
+        match &w.dialog {
+            Some(UserDialog::ChannelPick(p)) => {
+                assert_eq!(p.uuid7, "u1");
+                assert_eq!(p.username, "alice");
+                assert_eq!(p.channels, vec!["twitch:1 (alice_tv)".to_string()]);
+            }
+            other => panic!("expected ChannelPick, got {:?}", other),
+        }
+
+        // Enter opens the remove/split sub-menu.
+        assert_eq!(
+            w.dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+            Some(Action::Noop)
+        );
+        assert!(matches!(w.dialog, Some(UserDialog::ChannelAction(_))));
+
+        // Enter on the default (remove) emits `userdb_remove_channel`.
+        let action = w
+            .dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        match action {
+            Action::UserQuery(id, payload) => {
+                assert_eq!(id, REMOVE_CHANNEL_QUERY_ID);
+                let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(v["uuid7"], "u1");
+                assert_eq!(v["platform"], "twitch");
+                assert_eq!(v["channel_id"], "1");
+            }
+            other => panic!("expected UserQuery, got {:?}", other),
+        }
+        assert!(!w.in_dialog(), "a channel action closes the menu");
+
+        // Redo, but pick split (move the highlight down).
+        w.dialog = Some(UserDialog::Menu {
+            uuid7: "u1".to_string(),
+            username: "alice".to_string(),
+        });
+        assert_eq!(w.dialog_key(key('h')), Some(Action::Noop));
+        assert_eq!(
+            w.dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+            Some(Action::Noop)
+        );
+        assert_eq!(w.dialog_key(key('j')), Some(Action::Noop));
+        let action = w
+            .dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        match action {
+            Action::UserQuery(id, payload) => {
+                assert_eq!(id, SPLIT_CHANNEL_QUERY_ID);
+                let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(v["uuid7"], "u1");
+                assert_eq!(v["platform"], "twitch");
+                assert_eq!(v["channel_id"], "1");
+                assert_eq!(v["handle"], "alice_tv");
+            }
+            other => panic!("expected UserQuery, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn channel_pick_with_no_channels_does_not_emit() {
+        let mut w = UserManagementWindow::new();
+        w.menu_channels.clear();
+        w.dialog = Some(UserDialog::Menu {
+            uuid7: "u2".to_string(),
+            username: "bob".to_string(),
+        });
+        assert_eq!(w.dialog_key(key('h')), Some(Action::Noop));
+        // Enter on an empty list stays in the picker and emits nothing.
+        assert_eq!(
+            w.dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+            Some(Action::Noop)
+        );
+        assert!(matches!(w.dialog, Some(UserDialog::ChannelPick(_))));
+    }
+
+    #[test]
+    fn permissions_submenu_emits_set_roles_preserving_sponsor_and_owner() {
+        let mut w = UserManagementWindow::new();
+        let mut stats = stats_with_users();
+        // Make the target a sponsor AND owner so preservation is observable.
+        stats.users[0].is_sponsor = true;
+        stats.users[0].is_owner = true;
+
+        let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+
+        // open_menu captures the roles.
+        w.handle_key(enter(), &mut stats);
+        assert_eq!(w.menu_roles, (true, false, false, true));
+
+        // `p` opens the permissions sub-menu; default choice is mod.
+        assert_eq!(w.dialog_key(key('p')), Some(Action::Noop));
+        assert!(matches!(w.dialog, Some(UserDialog::Permissions(_))));
+        let action = w.dialog_key(enter()).unwrap();
+        match action {
+            Action::UserQuery(id, payload) => {
+                assert_eq!(id, SET_ROLES_QUERY_ID);
+                let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(v["uuid7"], "u1");
+                assert_eq!(v["actor_role"], "owner");
+                assert_eq!(v["actor_uuid7"], "cockatiel-tui");
+                assert_eq!(v["is_sponsor"], true, "sponsor preserved");
+                assert_eq!(v["is_owner"], true, "owner preserved");
+                assert_eq!(v["is_moderator"], true);
+                assert_eq!(v["is_admin"], false);
+            }
+            other => panic!("expected UserQuery, got {:?}", other),
+        }
+        assert!(!w.in_dialog());
+
+        // `2` promotes to admin (mod cleared, admin set).
+        w.handle_key(enter(), &mut stats);
+        assert_eq!(w.dialog_key(key('p')), Some(Action::Noop));
+        match w.dialog_key(key('2')).unwrap() {
+            Action::UserQuery(_, payload) => {
+                let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(v["is_moderator"], false);
+                assert_eq!(v["is_admin"], true);
+                assert_eq!(v["is_sponsor"], true);
+            }
+            other => panic!("expected UserQuery, got {:?}", other),
+        }
+
+        // `3` demotes (both mod + admin cleared).
+        w.handle_key(enter(), &mut stats);
+        assert_eq!(w.dialog_key(key('p')), Some(Action::Noop));
+        match w.dialog_key(key('3')).unwrap() {
+            Action::UserQuery(_, payload) => {
+                let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(v["is_moderator"], false);
+                assert_eq!(v["is_admin"], false);
+                assert_eq!(v["is_owner"], true);
+            }
+            other => panic!("expected UserQuery, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn render_draws_the_channels_and_permissions_menus() {
+        let mut w = UserManagementWindow::new();
+        let stats = stats_with_users();
+        let colors = default_colors();
+        let hotkeys = default_hotkeys();
+
+        w.dialog = Some(UserDialog::ChannelPick(ChannelPickState {
+            uuid7: "u1".into(),
+            username: "alice".into(),
+            channels: vec!["twitch:1 (alice_tv)".into()],
+            selected: 0,
+        }));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        w.render(
+            Rect::new(0, 0, 80, 24),
+            &mut buf,
+            true,
+            &stats,
+            &colors,
+            &hotkeys,
+            &[],
+        );
+        let mut all = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                all.push_str(buf[(x, y)].symbol());
+            }
+            all.push('\n');
+        }
+        assert!(all.contains("channels"), "channels title missing:\n{}", all);
+        assert!(
+            all.contains("twitch:alice_tv"),
+            "channel row missing:\n{}",
+            all
+        );
+
+        w.dialog = Some(UserDialog::Permissions(PermissionsState {
+            uuid7: "u1".into(),
+            username: "alice".into(),
+            is_sponsor: false,
+            is_owner: false,
+            selected: 0,
+        }));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        w.render(
+            Rect::new(0, 0, 80, 24),
+            &mut buf,
+            true,
+            &stats,
+            &colors,
+            &hotkeys,
+            &[],
+        );
+        let mut all = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                all.push_str(buf[(x, y)].symbol());
+            }
+            all.push('\n');
+        }
+        assert!(
+            all.contains("promote to moderator"),
+            "mod option missing:\n{}",
+            all
+        );
+        assert!(
+            all.contains("promote to admin"),
+            "admin option missing:\n{}",
+            all
+        );
+        assert!(all.contains("demote"), "demote option missing:\n{}", all);
     }
 }
