@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Rect};
@@ -37,6 +39,15 @@ pub struct UserManagementWindow {
     /// Whether the account being linked is already merged (more than one
     /// channel), captured alongside the candidates. Gates the 3-option prompt.
     link_source_merged: bool,
+    /// The `(uuid7, score)` of the user the action menu was opened on, captured
+    /// in [`UserManagementWindow::open_menu`] (the dialog-key path cannot reach
+    /// `stats`). A successful adjustment applies optimistically on top of this
+    /// base. Refreshed on every menu open and cleared once the dialog closes.
+    menu_base: Option<(String, i32)>,
+    /// Pending optimistic score deltas by uuid7: `(base_score, accumulated
+    /// delta)`. A row displays `base + delta` until the polled score moves off
+    /// `base`, at which point the entry is reconciled away.
+    optimistic: HashMap<String, (i32, i32)>,
 }
 
 /// The user-management modal. The `Menu` lists the per-user actions; the
@@ -270,6 +281,8 @@ impl UserManagementWindow {
             status: None,
             link_candidates: Vec::new(),
             link_source_merged: false,
+            menu_base: None,
+            optimistic: HashMap::new(),
         }
     }
 
@@ -325,10 +338,24 @@ impl UserManagementWindow {
             .cloned()
             .collect();
         self.link_source_merged = is_merged(user);
+        // Capture the base score so a later adjustment can be shown instantly;
+        // the dialog-key path has no access to `stats`.
+        self.menu_base = Some((user.uuid7.clone(), user.score));
         self.dialog = Some(UserDialog::Menu {
             uuid7: user.uuid7.clone(),
             username: user.username.clone(),
         });
+    }
+
+    /// Apply an optimistic score delta for `uuid7`, but only when the open menu
+    /// was captured for that same user. A no-op otherwise (e.g. a dialog opened
+    /// directly in tests, or a stale menu from a previous selection).
+    fn bump_optimistic(&mut self, uuid7: &str, delta: i32) {
+        if let Some((base_uuid, base)) = self.menu_base.clone() {
+            if base_uuid == uuid7 {
+                apply_optimistic(&mut self.optimistic, uuid7, base, delta);
+            }
+        }
     }
 
     // ── key handling ────────────────────────────────────────────────
@@ -381,6 +408,8 @@ impl UserManagementWindow {
                 }
                 KeyCode::Char('c') => {
                     self.status = Some(format!("commendation sent for {}", username));
+                    // A commendation adds +1; show it before the poll lands.
+                    self.bump_optimistic(&uuid7, 1);
                     Some(rate_query(&uuid7, RateKind::Commend, ""))
                 }
                 KeyCode::Char('s') => {
@@ -421,6 +450,7 @@ impl UserManagementWindow {
                 KeyCode::Enter => match parse_delta(&input) {
                     Some(delta) => {
                         self.status = Some(format!("score {:+} applied to {}", delta, username));
+                        self.bump_optimistic(&uuid7, delta);
                         Some(adjust_score_query(&uuid7, delta))
                     }
                     None => {
@@ -713,11 +743,15 @@ impl UserManagementWindow {
             } else {
                 Self::rank_color(&tier)
             };
+            // While an optimistic delta is pending, show `base + delta` instead
+            // of the (stale) polled score so the row reacts instantly.
+            let shown_score =
+                optimistic_score(user.score, self.optimistic.get(&user.uuid7).copied());
             let score_color = if is_selected {
                 Color::Black
-            } else if user.score > 0 {
+            } else if shown_score > 0 {
                 Color::LightGreen
-            } else if user.score < 0 {
+            } else if shown_score < 0 {
                 Color::LightRed
             } else {
                 Color::DarkGray
@@ -736,7 +770,7 @@ impl UserManagementWindow {
                     row_style(is_selected).fg(name_color),
                 ),
                 Span::styled(
-                    format!("{:>7}", user.score),
+                    format!("{:>7}", shown_score),
                     row_style(is_selected).fg(score_color),
                 ),
                 Span::styled(
@@ -858,6 +892,38 @@ pub(crate) fn adjust_score_query(uuid7: &str, delta: i32) -> Action {
         "multiplier": false,
     });
     Action::UserQuery("userdb_adjust_score".to_string(), payload.to_string())
+}
+
+/// The score a row should display: the pending optimistic value while one is
+/// recorded for the user, otherwise the polled value.
+pub(crate) fn optimistic_score(user_score: i32, pending: Option<(i32, i32)>) -> i32 {
+    match pending {
+        Some((base, delta)) => base.saturating_add(delta),
+        None => user_score,
+    }
+}
+
+/// Accumulate an optimistic delta for `uuid7` on top of `base`. Multiple
+/// adjustments issued before the poll catches up sum together.
+pub(crate) fn apply_optimistic(
+    optimistic: &mut HashMap<String, (i32, i32)>,
+    uuid7: &str,
+    base: i32,
+    delta: i32,
+) {
+    let entry = optimistic.entry(uuid7.to_string()).or_insert((base, 0));
+    entry.1 = entry.1.saturating_add(delta);
+}
+
+/// Drop optimistic entries the poll has caught up on (the polled score no
+/// longer equals the captured base) or whose user has vanished.
+pub(crate) fn reconcile(optimistic: &mut HashMap<String, (i32, i32)>, polled: &[UserSummary]) {
+    optimistic.retain(|uuid, (base, _)| {
+        polled
+            .iter()
+            .find(|u| &u.uuid7 == uuid)
+            .is_some_and(|u| u.score == *base)
+    });
 }
 
 /// The fuzzy match score for a user: the best score across the cockatiel
@@ -1232,6 +1298,14 @@ impl Window for UserManagementWindow {
     ) {
         let list = self.filtered_users(&stats.users);
         self.clamp_selection(list.len());
+
+        // A closed dialog re-captures its base on the next open. The optimistic
+        // map is then reconciled against the fresh poll: an entry whose user
+        // vanished or whose polled score moved off the base is dropped.
+        if self.dialog.is_none() {
+            self.menu_base = None;
+        }
+        reconcile(&mut self.optimistic, &stats.users);
 
         let border_color = if is_active {
             colors.active_border_color("user_management")
@@ -1615,6 +1689,84 @@ mod tests {
         assert_eq!(parse_delta(""), None);
         assert_eq!(parse_delta("abc"), None);
         assert_eq!(parse_delta("+7"), Some(7));
+    }
+
+    #[test]
+    fn optimistic_score_prefers_the_pending_value() {
+        assert_eq!(optimistic_score(60, None), 60);
+        assert_eq!(optimistic_score(60, Some((60, -5))), 55);
+        assert_eq!(optimistic_score(60, Some((60, 7))), 67);
+        assert_eq!(optimistic_score(-8, Some((-8, -1))), -9);
+    }
+
+    #[test]
+    fn optimistic_entries_accumulate_then_reconcile() {
+        let mut pending = HashMap::new();
+        apply_optimistic(&mut pending, "u1", 60, -5);
+        apply_optimistic(&mut pending, "u1", 60, 3);
+        assert_eq!(pending.get("u1").copied(), Some((60, -2)));
+        assert_eq!(optimistic_score(60, pending.get("u1").copied()), 58);
+
+        // The poll still reports the base score: the pending delta is kept.
+        reconcile(&mut pending, &[user("u1", "alice", 60, 0.9, &[])]);
+        assert_eq!(pending.len(), 1);
+
+        // The poll catches up: the entry is dropped and the polled value shows.
+        reconcile(&mut pending, &[user("u1", "alice", 58, 0.9, &[])]);
+        assert!(pending.is_empty());
+        assert_eq!(optimistic_score(58, pending.get("u1").copied()), 58);
+    }
+
+    #[test]
+    fn reconcile_drops_vanished_users() {
+        let mut pending = HashMap::new();
+        apply_optimistic(&mut pending, "gone", 10, 1);
+        reconcile(&mut pending, &[]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn applying_an_adjustment_updates_the_row_optimistically() {
+        let mut w = UserManagementWindow::new();
+        let mut stats = stats_with_users();
+
+        // Enter opens the menu on alice (u1, score 60) and captures the base.
+        w.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut stats,
+        );
+        assert_eq!(w.menu_base, Some(("u1".to_string(), 60)));
+
+        // `s` then entering `-2` emits the query and accumulates the delta.
+        assert_eq!(w.dialog_key(key('s')), Some(Action::Noop));
+        assert_eq!(w.dialog_key(key('-')), Some(Action::Noop));
+        assert_eq!(w.dialog_key(key('2')), Some(Action::Noop));
+        assert!(matches!(
+            w.dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+            Some(Action::UserQuery(_, _))
+        ));
+        assert_eq!(w.optimistic.get("u1").copied(), Some((60, -2)));
+        assert_eq!(optimistic_score(60, w.optimistic.get("u1").copied()), 58);
+    }
+
+    #[test]
+    fn commend_bumps_score_optimistically_but_reprimand_does_not() {
+        let mut w = UserManagementWindow::new();
+        let mut stats = stats_with_users();
+        w.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut stats,
+        );
+        w.dialog_key(key('c'));
+        assert_eq!(w.optimistic.get("u1").copied(), Some((60, 1)));
+
+        let mut w2 = UserManagementWindow::new();
+        w2.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut stats,
+        );
+        w2.dialog_key(key('r'));
+        assert!(w2.optimistic.is_empty(), "a reprimand changes no score");
     }
 
     #[test]
