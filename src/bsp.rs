@@ -229,13 +229,15 @@ impl LayoutTree {
     }
 
     /// Rebuild the tree from a snapshot. Window state is recreated fresh.
-    pub fn from_snapshot(snap: LayoutSnapshot) -> LayoutTree {
-        let root = from_snapshot_node(snap);
+    /// Returns `None` when any persisted ratio is non-finite — a malformed
+    /// snapshot is rejected wholesale rather than half-loaded.
+    pub fn from_snapshot(snap: LayoutSnapshot) -> Option<LayoutTree> {
+        let root = from_snapshot_node(snap)?;
         // Focus the first leaf (depth-first order) after rebuild.
         let mut tree = LayoutTree { root, focus: Vec::new(), dragging: None, drag_start: None };
         let first = tree.leaf_order().first().cloned().map(|(id, _)| id).unwrap_or_else(|| "pane".to_string());
         tree.focus = tree.path_to_id(&first);
-        tree
+        Some(tree)
     }
 
     /// Save the layout structure to `path` (atomic temp+rename).
@@ -251,7 +253,7 @@ impl LayoutTree {
     pub fn load(path: &std::path::Path) -> Option<LayoutTree> {
         let content = std::fs::read_to_string(path).ok()?;
         let snap: LayoutSnapshot = serde_json::from_str(&content).ok()?;
-        Some(LayoutTree::from_snapshot(snap))
+        LayoutTree::from_snapshot(snap)
     }
 }
 
@@ -267,17 +269,27 @@ fn snapshot_node(node: &Node) -> LayoutSnapshot {
     }
 }
 
-fn from_snapshot_node(snap: LayoutSnapshot) -> Box<Node> {
+fn from_snapshot_node(snap: LayoutSnapshot) -> Option<Box<Node>> {
     match snap {
         LayoutSnapshot::Leaf { id, view } => {
             let view = ViewType::from_name(&view).unwrap_or(ViewType::Logs);
-            leaf(&id, view)
+            Some(leaf(&id, view))
         }
         LayoutSnapshot::Split { axis, ratio, a, b } => {
+            // A persisted ratio of 0.0/1.0 (or any non-finite value) must never
+            // survive a reload: clamp it into the legal band so no pane comes
+            // back collapsed to zero cells.
+            let ratio = sanitize_ratio(ratio)?;
             let axis = if axis == "v" { Axis::Vertical } else { Axis::Horizontal };
-            split(axis, ratio, from_snapshot_node(*a), from_snapshot_node(*b))
+            Some(split(axis, ratio, from_snapshot_node(*a)?, from_snapshot_node(*b)?))
         }
     }
+}
+
+/// A persisted ratio is legal only inside `0.05..=0.95`. Non-finite values
+/// reject the snapshot (`None`); finite out-of-range values are clamped.
+fn sanitize_ratio(ratio: f32) -> Option<f32> {
+    ratio.is_finite().then(|| ratio.clamp(0.05, 0.95))
 }
 
 /// Build a tree with a single leaf (detached pop-out mode).
@@ -343,9 +355,19 @@ pub fn make_window(view: ViewType) -> Box<dyn Window> {
 }
 
 impl LayoutTree {
-    /// Recursively compute every leaf's rectangle from `root_rect`, honoring
-    /// `ratio` at each split and clamping to the minimum pane size.
+    /// Recursively compute every leaf's rectangle from `root_rect`. At each
+    /// split the stored `ratio` is re-clamped against the split's rect so both
+    /// children keep at least `MIN_WIDTH`/`MIN_HEIGHT` cells (or at least one
+    /// cell each on a parent too small for the full minimum) — a split can
+    /// never produce a zero-cell pane.
     pub fn compute(&mut self, root_rect: Rect) {
+        compute_node(&mut self.root, root_rect);
+    }
+
+    /// Re-clamp every split against its recomputed rectangle. Called when the
+    /// terminal is resized so a divider dragged to the edge at one size cannot
+    /// leave a pane collapsed at the new size.
+    pub fn renormalize(&mut self, root_rect: Rect) {
         compute_node(&mut self.root, root_rect);
     }
 
@@ -688,10 +710,13 @@ impl LayoutTree {
     }
 
     /// Move the divider of the split at `path` by `delta` (fraction of the
-    /// split's full extent; positive grows child_a). Clamped to 0.05..0.95.
+    /// split's full extent; positive grows child_a). The candidate ratio is
+    /// clamped against the split's own rect so neither child is reduced below
+    /// `MIN_WIDTH`/`MIN_HEIGHT` cells (or one cell on a tiny parent).
     pub fn resize_split(&mut self, path: &[usize], delta: f32) -> bool {
         if let Node::Split(s) = leaf_at_mut(&mut self.root, path) {
-            let new_ratio = (s.ratio + delta).clamp(0.05, 0.95);
+            let (extent, min_cells) = split_extent_and_min(s);
+            let new_ratio = clamp_ratio_to_cells(s.ratio + delta, extent, min_cells);
             if (new_ratio - s.ratio).abs() < f32::EPSILON {
                 return false;
             }
@@ -808,8 +833,10 @@ impl LayoutTree {
 
     /// Resize the focused leaf's shared split by adjusting the parent ratio.
     /// `delta` is a signed fraction of the full pane size (positive grows the
-    /// left/top child). Returns false if the move would breach the minimum
-    /// pane size.
+    /// left/top child). The candidate ratio is clamped against the parent
+    /// split's own rect so the move can never shrink either child below
+    /// `MIN_WIDTH`/`MIN_HEIGHT` cells (or one cell on a tiny parent). Returns
+    /// false when the clamp leaves the ratio unchanged.
     pub fn resize_focused(&mut self, delta: f32) -> bool {
         if self.focus.len() < 2 {
             return false;
@@ -819,18 +846,12 @@ impl LayoutTree {
         let parent = leaf_at_mut(&mut self.root, parent_path);
         let Node::Split(s) = parent else { return false };
 
-        let new_ratio = if which == 0 {
-            s.ratio + delta
-        } else {
-            s.ratio - delta
-        };
-        let new_ratio = new_ratio.clamp(0.05, 0.95);
+        let candidate = if which == 0 { s.ratio + delta } else { s.ratio - delta };
+        let (extent, min_cells) = split_extent_and_min(s);
+        let new_ratio = clamp_ratio_to_cells(candidate, extent, min_cells);
         if (new_ratio - s.ratio).abs() < f32::EPSILON {
             return false;
         }
-        // The actual min-size check needs the rects; compute is separate. The
-        // clamp to [0.05, 0.95] keeps panes far above MIN in any sane terminal,
-        // so we accept the clamp as the guard here.
         s.ratio = new_ratio;
         true
     }
@@ -863,6 +884,10 @@ fn compute_node(node: &mut Node, rect: Rect) {
     match node {
         Node::Split(s) => {
             s.rect = rect;
+            let (extent, min_cells) = split_extent_and_min(s);
+            // Re-clamp on every compute so a ratio stored at one terminal size
+            // (or loaded from disk) cannot leave a pane collapsed at another.
+            s.ratio = clamp_ratio_to_cells(s.ratio, extent, min_cells);
             let (a, b) = split_rects(s.axis, s.ratio, rect);
             compute_node(&mut s.child_a, a);
             compute_node(&mut s.child_b, b);
@@ -871,6 +896,37 @@ fn compute_node(node: &mut Node, rect: Rect) {
             l.rect = rect;
         }
     }
+}
+
+/// The split's extent (in cells) along its axis and the minimum child size that
+/// applies to it. `rect` may be unset (`0` extent) before the first `compute`.
+fn split_extent_and_min(s: &SplitNode) -> (u16, u16) {
+    match s.axis {
+        Axis::Horizontal => (s.rect.width, MIN_WIDTH),
+        Axis::Vertical => (s.rect.height, MIN_HEIGHT),
+    }
+}
+
+/// Clamp `ratio` so that neither child of a split is collapsed to zero cells.
+/// Given the parent `extent` in cells and the applicable `min_cells`, each side
+/// keeps at least `min_cells` when the parent is large enough; on a parent too
+/// small for that, the floor degrades to half the extent so both children still
+/// get at least one cell whenever `extent >= 2`. The result is always
+/// intersected with the absolute `0.05..=0.95` band. An unset (`< 2`) extent
+/// falls back to that band.
+fn clamp_ratio_to_cells(ratio: f32, extent: u16, min_cells: u16) -> f32 {
+    if !ratio.is_finite() {
+        return 0.5;
+    }
+    if extent < 2 {
+        return ratio.clamp(0.05, 0.95);
+    }
+    // Half a cell of slack absorbs the float→cell truncation in `split_rects`,
+    // so a ratio at the floor still yields `min_cells` whole cells.
+    let floor = (min_cells as f32 + 0.5).min(extent as f32 / 2.0) / extent as f32;
+    let lo = floor.max(0.05);
+    let hi = (1.0 - floor).min(0.95);
+    ratio.clamp(lo, hi)
 }
 
 pub(crate) fn leaf_at<'a>(node: &'a Node, path: &[usize]) -> &'a Node {
@@ -890,7 +946,7 @@ pub(crate) fn leaf_at<'a>(node: &'a Node, path: &[usize]) -> &'a Node {
 pub fn split_rects(axis: Axis, ratio: f32, rect: Rect) -> (Rect, Rect) {
     match axis {
         Axis::Horizontal => {
-            let left = (rect.width as f32 * ratio) as u16;
+            let left = split_offset(rect.width, ratio);
             let right = rect.width.saturating_sub(left);
             (
                 Rect { x: rect.x, y: rect.y, width: left, height: rect.height },
@@ -898,13 +954,27 @@ pub fn split_rects(axis: Axis, ratio: f32, rect: Rect) -> (Rect, Rect) {
             )
         }
         Axis::Vertical => {
-            let top = (rect.height as f32 * ratio) as u16;
+            let top = split_offset(rect.height, ratio);
             let bottom = rect.height.saturating_sub(top);
             (
                 Rect { x: rect.x, y: rect.y, width: rect.width, height: top },
                 Rect { x: rect.x, y: rect.y + top, width: rect.width, height: bottom },
             )
         }
+    }
+}
+
+/// The child_a extent (in cells) of a split of `extent` cells by `ratio`. Keeps
+/// at least one cell on each side whenever `extent >= 2`, so a divider can never
+/// collapse a pane to zero. `ratio` is clamped to `0..=1` first so a malformed
+/// value cannot overflow the cast.
+fn split_offset(extent: u16, ratio: f32) -> u16 {
+    let ratio = if ratio.is_finite() { ratio.clamp(0.0, 1.0) } else { 0.5 };
+    let raw = (extent as f32 * ratio) as u16;
+    if extent >= 2 {
+        raw.clamp(1, extent - 1)
+    } else {
+        raw.min(extent)
     }
 }
 
@@ -1178,11 +1248,118 @@ mod tests {
         assert!(t.split_focused(crate::bsp::Axis::Horizontal));
         t.swap_focused_view(crate::bsp::ViewType::TopUsers);
         let snap = t.snapshot();
-        let rebuilt = LayoutTree::from_snapshot(snap);
+        let rebuilt = LayoutTree::from_snapshot(snap).expect("a well-formed snapshot loads");
         // Same leaf views in the same order.
         let a: Vec<&str> = t.leaf_order().iter().map(|(_, v)| v.name()).collect();
         let b: Vec<&str> = rebuilt.leaf_order().iter().map(|(_, v)| v.name()).collect();
         assert_eq!(a, b);
+    }
+
+    /// A two-leaf tree split along `axis`, focused on child_a.
+    fn two_leaf(axis: Axis) -> LayoutTree {
+        LayoutTree {
+            root: split(axis, 0.5, leaf("a", ViewType::Logs), leaf("b", ViewType::Logs)),
+            focus: vec![0],
+            dragging: None,
+            drag_start: None,
+        }
+    }
+
+    #[test]
+    fn resizing_to_an_extreme_keeps_both_children_at_least_min() {
+        let root = Rect { x: 0, y: 0, width: 120, height: 40 };
+
+        // Dragging the divider hard right must stop so child_b keeps MIN_WIDTH.
+        let mut t = two_leaf(Axis::Horizontal);
+        t.compute(root);
+        assert!(t.resize_split(&[], 10.0), "a big right drag must move the divider");
+        t.compute(root);
+        let (_, ratio) = t.split_at(&[]).unwrap();
+        let (a, b) = split_rects(Axis::Horizontal, ratio, root);
+        assert!(a.width >= MIN_WIDTH && b.width >= MIN_WIDTH, "right drag: a={} b={}", a.width, b.width);
+
+        // Dragging hard left must stop so child_a keeps MIN_WIDTH.
+        let mut t = two_leaf(Axis::Horizontal);
+        t.compute(root);
+        assert!(t.resize_split(&[], -10.0), "a big left drag must move the divider");
+        t.compute(root);
+        let (_, ratio) = t.split_at(&[]).unwrap();
+        let (a, b) = split_rects(Axis::Horizontal, ratio, root);
+        assert!(a.width >= MIN_WIDTH && b.width >= MIN_WIDTH, "left drag: a={} b={}", a.width, b.width);
+
+        // The focused-resize path enforces the same cell-aware floor. It acts on
+        // the focused leaf's PARENT split, so the leaf must sit below the root.
+        let mut t = LayoutTree {
+            root: split(
+                Axis::Horizontal,
+                0.5,
+                split(Axis::Vertical, 0.5, leaf("a", ViewType::Logs), leaf("b", ViewType::Logs)),
+                leaf("c", ViewType::Logs),
+            ),
+            focus: vec![0, 0],
+            dragging: None,
+            drag_start: None,
+        };
+        t.compute(root);
+        assert!(t.resize_focused(10.0), "a big focused resize must move the divider");
+        t.compute(root);
+        let (_, ratio) = t.split_at(&[0]).unwrap();
+        let (a, b) = split_rects(Axis::Vertical, ratio, Rect { x: 0, y: 0, width: 60, height: 40 });
+        assert!(a.height >= MIN_HEIGHT && b.height >= MIN_HEIGHT, "focused: a={} b={}", a.height, b.height);
+    }
+
+    #[test]
+    fn a_snapshot_with_collapsed_ratios_loads_without_zero_cell_panes() {
+        // 0.0 and 1.0 are exactly the ratios a divider dragged to the edge
+        // persists; both must be clamped on load.
+        let snap = LayoutSnapshot::Split {
+            axis: "h".to_string(),
+            ratio: 0.0,
+            a: Box::new(LayoutSnapshot::Leaf { id: "a".to_string(), view: "logs".to_string() }),
+            b: Box::new(LayoutSnapshot::Split {
+                axis: "v".to_string(),
+                ratio: 1.0,
+                a: Box::new(LayoutSnapshot::Leaf { id: "b".to_string(), view: "logs".to_string() }),
+                b: Box::new(LayoutSnapshot::Leaf { id: "c".to_string(), view: "prompts".to_string() }),
+            }),
+        };
+        let mut t = LayoutTree::from_snapshot(snap).expect("out-of-range ratios are clamped, not rejected");
+        t.compute(Rect { x: 0, y: 0, width: 120, height: 40 });
+        for (id, _, rect, _) in t.leaves() {
+            assert!(rect.width > 0 && rect.height > 0, "pane {id} collapsed: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_finite_ratio_rejects_the_whole_snapshot() {
+        let snap = LayoutSnapshot::Split {
+            axis: "h".to_string(),
+            ratio: f32::NAN,
+            a: Box::new(LayoutSnapshot::Leaf { id: "a".to_string(), view: "logs".to_string() }),
+            b: Box::new(LayoutSnapshot::Leaf { id: "b".to_string(), view: "logs".to_string() }),
+        };
+        assert!(LayoutTree::from_snapshot(snap).is_none());
+    }
+
+    #[test]
+    fn a_tiny_parent_extent_never_zeroes_a_child() {
+        for extent in 2u16..10 {
+            let rect = Rect { x: 0, y: 0, width: extent, height: extent };
+            let mut t = two_leaf(Axis::Horizontal);
+            t.compute(rect);
+            let (_, ratio) = t.split_at(&[]).unwrap();
+            let (a, b) = split_rects(Axis::Horizontal, ratio, rect);
+            assert!(a.width >= 1 && b.width >= 1, "extent={extent}: a={} b={}", a.width, b.width);
+
+            let mut t = two_leaf(Axis::Vertical);
+            t.compute(rect);
+            let (_, ratio) = t.split_at(&[]).unwrap();
+            let (a, b) = split_rects(Axis::Vertical, ratio, rect);
+            assert!(a.height >= 1 && b.height >= 1, "extent={extent}: a={} b={}", a.height, b.height);
+        }
+        // extent < 2 cannot give both children a cell, but must not panic.
+        let mut t = two_leaf(Axis::Horizontal);
+        t.compute(Rect { x: 0, y: 0, width: 1, height: 1 });
     }
 
     #[test]

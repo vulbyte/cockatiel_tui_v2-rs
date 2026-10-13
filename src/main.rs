@@ -1757,7 +1757,12 @@ async fn handle_input_event(
         }
         AppEvent::Resize(w, h) => {
             if w > 0 && h > 0 {
-                let _ = terminal.resize(Rect::new(0, 0, w, h));
+                let area = Rect::new(0, 0, w, h);
+                let _ = terminal.resize(area);
+                // Re-clamp every divider against the new size so a split that
+                // was dragged to the edge at the old size cannot leave a pane
+                // collapsed (and un-grabbable) at the new one.
+                state.tree.renormalize(area);
             }
             Ok(false)
         }
