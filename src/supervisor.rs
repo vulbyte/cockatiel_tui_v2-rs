@@ -1684,6 +1684,7 @@ pub fn spawn_from_parts(p: &Plugin, cmd: &str, args: &[String]) -> Result<Child,
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    reap_stale_module_processes(&p.manifest.name, None);
     command
         .spawn()
         .map_err(|e| format!("Failed to launch '{}': {}", p.manifest.name, e))
@@ -2093,6 +2094,42 @@ fn kill_stale_terminal_processes(name: &str) {
         }
     }
 }
+
+/// Kill any OS process running this module (matched by its `--name <name>`
+/// launch marker) that is not the TUI itself and not `keep_pid` (the TUI's
+/// currently-tracked child, passed on a restart). A previous run — or a second
+/// launcher — could leave an orphaned process sharing the name; the engine
+/// evicts one of them and the two evict each other forever (the "flap"), so we
+/// reap the stale one before starting the replacement.
+#[cfg(unix)]
+pub fn reap_stale_module_processes(name: &str, keep_pid: Option<u32>) {
+    let self_pid = std::process::id();
+    let pattern = format!("--name {}", name);
+    let Ok(out) = Command::new("pgrep")
+        .arg("-f")
+        .arg("--")
+        .arg(&pattern)
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid || Some(pid) == keep_pid {
+            continue;
+        }
+        crate::app::supervisor_log_global(format!(
+            "[supervisor] reaping stale '{}' process (pid {})",
+            name, pid
+        ));
+        kill_pid(pid as i32);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn reap_stale_module_processes(_name: &str, _keep_pid: Option<u32>) {}
 
 /// Best-effort close of every Terminal.app window whose title contains
 /// `marker` (macOS only). Terminal only reliably closes the FRONT window, so we
