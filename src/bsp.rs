@@ -400,6 +400,14 @@ impl LayoutTree {
         }
     }
 
+    /// The focused leaf's window (immutable).
+    pub fn focused_window_ref(&self) -> Option<&dyn Window> {
+        match leaf_at(&self.root, &self.focus) {
+            Node::Leaf(l) => Some(l.content.window.as_ref()),
+            Node::Split(_) => None,
+        }
+    }
+
     /// The focused leaf's calculated rectangle (for rendering the active border).
     pub fn focused_rect(&self) -> Option<Rect> {
         match leaf_at(&self.root, &self.focus) {

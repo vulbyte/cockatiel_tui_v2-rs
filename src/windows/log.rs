@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style, Modifier};
@@ -55,31 +54,25 @@ impl LogFilter {
 }
 
 pub struct LogWindow {
-    pub entries: VecDeque<LogEntry>,
     pub filter: LogFilter,
-    pub max_entries: usize,
     pub scroll: usize,
 }
 
 impl LogWindow {
     pub fn new() -> Self {
         Self {
-            entries: VecDeque::new(),
             filter: LogFilter::All,
-            max_entries: 200,
             scroll: 0,
         }
     }
 
-    pub fn push(&mut self, entry: LogEntry) {
-        if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(entry);
-    }
-
-    fn filtered_entries(&self) -> Vec<&LogEntry> {
-        self.entries.iter().filter(|e| self.filter.matches(e)).collect()
+    /// The shared global buffer, filtered by this window's own filter. Entries
+    /// are cloned out (the buffer is global; a window holds no copy).
+    fn filtered_entries(&self) -> Vec<LogEntry> {
+        crate::app::log_snapshot()
+            .into_iter()
+            .filter(|e| self.filter.matches(e))
+            .collect()
     }
 
     fn tab_bar(&self) -> Line<'_> {
@@ -100,7 +93,7 @@ impl LogWindow {
 impl Window for LogWindow {
 
     fn push_log(&mut self, entry: LogEntry) {
-        self.push(entry);
+        crate::app::push_log_global(entry);
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, _stats: &GlobalStats, colors: &ColorConfig, _hotkeys: &crate::hotkeys::HotkeyConfig, _prompts: &[crate::app::PendingPrompt]) {

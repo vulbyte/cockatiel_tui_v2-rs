@@ -25,6 +25,38 @@ pub fn supervisor_log_global(message: String) {
     }
 }
 
+/// Global MAIN log buffer shared by every `LogWindow`. Mounting two log panes
+/// must show the same lines, so the entries live here rather than inside one
+/// window: a window keeps only its own `filter` + `scroll` and reads this.
+pub static LOG_LINES: OnceLock<Arc<Mutex<VecDeque<crate::windows::log::LogEntry>>>> =
+    OnceLock::new();
+
+/// Append an entry to the shared main log buffer (capped, like the supervisor
+/// queue). Called directly by the main loop so lines are never lost when no
+/// log pane happens to be mounted.
+pub fn push_log_global(entry: crate::windows::log::LogEntry) {
+    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
+    let mut q = q.lock().unwrap();
+    q.push_back(entry);
+    while q.len() > 500 {
+        q.pop_front();
+    }
+}
+
+/// A snapshot of the shared main log buffer, oldest first.
+pub fn log_snapshot() -> Vec<crate::windows::log::LogEntry> {
+    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
+    q.lock().unwrap().iter().cloned().collect()
+}
+
+/// Test-only: empty the shared main log buffer so a test starts from a known
+/// state. The buffer is process-global and shared by parallel tests.
+#[cfg(test)]
+pub fn clear_log_global() {
+    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
+    q.lock().unwrap().clear();
+}
+
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -155,6 +187,11 @@ pub trait Window {
     /// A clickable link rendered by this window (e.g. a prompt's link), if any.
     fn pending_link(&self) -> Option<(Rect, String)> { None }
     /// Append a log entry to this window (the log window displays them).
+    ///
+    /// The main loop now writes straight to the shared global buffer
+    /// (`push_log_global`), so the trait hook is exercised only by tests; it
+    /// stays as the window-facing entry point.
+    #[allow(dead_code)]
     fn push_log(&mut self, _entry: LogEntry) {}
     /// Which prompt in the queue this window should highlight (only the
     /// prompts window uses this).
@@ -571,7 +608,24 @@ impl AppState {
     }
 
     pub fn get_window_mut(&mut self, id: WindowId) -> Option<&mut Box<dyn Window>> {
+        // Prefer the FOCUSED leaf when it hosts this view: with two panes of
+        // the same view mounted, the focused one is the one the operator is
+        // acting on. `window_mut_by_id` (first-match) stays the fallback.
+        if id == self.active_window && self.tree.focused_window().is_some() {
+            return self.tree.focused_window();
+        }
         self.tree.window_mut_by_id(id)
+    }
+
+    /// Immutable mirror of [`AppState::get_window_mut`]: prefer the focused
+    /// leaf when it hosts `id`, else fall back to the first leaf that does.
+    pub fn window_by_id(&self, id: WindowId) -> Option<&dyn Window> {
+        if id == self.active_window {
+            if let Some(w) = self.tree.focused_window_ref() {
+                return Some(w);
+            }
+        }
+        self.tree.window_by_id(id)
     }
 
     /// Sync `active_window` from the tree's focused leaf, so code that still
@@ -997,14 +1051,12 @@ mod screen_shape_tests {
         let mut s = state_with_windows();
         let before = shape(&s);
         for i in 0..50 {
-            if let Some(w) = s.tree.window_mut_by_id(crate::app::WindowId::Log) {
-                w.push_log(crate::windows::log::LogEntry {
-                    timestamp: String::new(),
-                    source: format!("mod-{}", i),
-                    message: "something happened".to_string(),
-                    event_type: 1,
-                });
-            }
+            crate::app::push_log_global(crate::windows::log::LogEntry {
+                timestamp: String::new(),
+                source: format!("mod-{}", i),
+                message: "something happened".to_string(),
+                event_type: 1,
+            });
         }
         s.stats.total_commands += 50;
         assert_eq!(shape(&s), before, "content churn must not count as a shape change");
@@ -1179,6 +1231,171 @@ mod full_repaint_tests {
         assert!(
             s.needs_full_repaint(focused, Some(focused)),
             "Ctrl+L must repaint on demand"
+        );
+    }
+}
+
+#[cfg(test)]
+mod same_view_panes_tests {
+    use super::*;
+    use crate::bsp::{Axis, LayoutTree, LeafContent, LeafNode, Node, SplitNode, ViewType};
+    use crate::windows::log::LogEntry;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    fn log_leaf(id: &str) -> Node {
+        Node::Leaf(LeafNode {
+            id: id.to_string(),
+            content: LeafContent {
+                view: ViewType::Logs,
+                window: crate::bsp::make_window(ViewType::Logs),
+            },
+            rect: Rect::default(),
+        })
+    }
+
+    /// A tree with TWO log panes side by side; focus is on the SECOND.
+    fn two_log_panes() -> LayoutTree {
+        LayoutTree {
+            root: Box::new(Node::Split(SplitNode {
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                rect: Rect::default(),
+                child_a: Box::new(log_leaf("first")),
+                child_b: Box::new(log_leaf("second")),
+            })),
+            focus: vec![1],
+            dragging: None,
+            drag_start: None,
+        }
+    }
+
+    fn state_with_two_log_panes() -> AppState {
+        let mut s = AppState::new(
+            crate::colors::load_colors(&std::path::PathBuf::from("")),
+            crate::hotkeys::default_hotkeys(),
+        );
+        s.tree = two_log_panes();
+        s.active_window = WindowId::Log;
+        s
+    }
+
+    fn rects(s: &AppState, _area: Rect) -> std::collections::HashMap<String, Rect> {
+        s.tree
+            .leaves()
+            .into_iter()
+            .map(|(id, _, r, _)| (id, r))
+            .collect()
+    }
+
+    /// The active filter tab is the only cell run painted with a white
+    /// background; find it inside `area` and return its label.
+    fn active_filter(buf: &Buffer, area: Rect) -> String {
+        for y in area.y..area.y + area.height {
+            let mut run = String::new();
+            for x in area.x..area.x + area.width {
+                let cell = &buf[(x, y)];
+                if cell.bg == Color::White {
+                    run.push_str(cell.symbol());
+                } else if !run.is_empty() {
+                    return run.trim().to_string();
+                }
+            }
+            if !run.is_empty() {
+                return run.trim().to_string();
+            }
+        }
+        String::new()
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in buf.area.y..buf.area.y + buf.area.height {
+            for x in buf.area.x..buf.area.x + buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The reported bug: with two panes of the same view, the FOCUSED pane must
+    /// receive the key and mutate ITS own state, not the first-mounted pane.
+    #[test]
+    fn a_key_mutates_the_focused_pane_not_the_first() {
+        let mut s = state_with_two_log_panes();
+
+        // The accessor resolves the focused (second) pane...
+        let focused = s.tree.focused_window_ref().unwrap() as *const dyn Window;
+        let resolved = s.window_by_id(WindowId::Log).unwrap() as *const dyn Window;
+        assert!(
+            std::ptr::eq(focused, resolved),
+            "window_by_id must resolve the focused pane"
+        );
+        // ...and NOT the first leaf (which is a different pane).
+        let first = s.tree.window_by_id(WindowId::Log).unwrap() as *const dyn Window;
+        assert!(
+            !std::ptr::eq(focused, first),
+            "the focused pane must not be the first leaf"
+        );
+
+        // A key handled through the app lands on the focused pane only.
+        let mut stats = std::mem::take(&mut s.stats);
+        s.get_window_mut(WindowId::Log).unwrap().handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('3'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &mut stats,
+        );
+        s.stats = stats;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| s.render_windows(f, area, false)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rects = rects(&s, area);
+
+        assert_eq!(
+            active_filter(&buf, rects["second"]),
+            "[Errors]",
+            "the focused pane's filter changed"
+        );
+        assert_eq!(
+            active_filter(&buf, rects["first"]),
+            "[All]",
+            "the first pane must be untouched"
+        );
+    }
+
+    /// One global push is rendered by BOTH log panes (they share the buffer),
+    /// while each keeps its own filter/scroll.
+    #[test]
+    fn one_global_push_is_rendered_by_both_log_panes() {
+        // The buffer is process-global; start from a known state. A tall pane
+        // keeps every buffered entry (cap 500) visible regardless of what other
+        // parallel tests append.
+        crate::app::clear_log_global();
+        let message = "shared-buffer-line-7f3a";
+        crate::app::push_log_global(LogEntry {
+            timestamp: String::new(),
+            source: "test".to_string(),
+            message: message.to_string(),
+            event_type: 1,
+        });
+
+        let mut s = state_with_two_log_panes();
+        let area = Rect::new(0, 0, 120, 560);
+        let mut term = Terminal::new(TestBackend::new(120, 560)).unwrap();
+        term.draw(|f| s.render_windows(f, area, false)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+
+        assert_eq!(
+            text.matches(message).count(),
+            2,
+            "each of the two panes must render the shared line:\n{text}"
         );
     }
 }

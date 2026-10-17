@@ -1024,10 +1024,11 @@ async fn run_app(
                 drained.extend(q.lock().unwrap().drain(..));
             }
             if !drained.is_empty() {
-                if let Some(window) = state.get_window_mut(WindowId::Log) {
-                    for entry in drained {
-                        window.push_log(entry);
-                    }
+                // Push into the SHARED log buffer directly, not through a
+                // mounted log window: with no log pane mounted the lines must
+                // still be retained (and every log pane renders the same set).
+                for entry in drained {
+                    crate::app::push_log_global(entry);
                 }
             }
         }
@@ -1245,14 +1246,12 @@ fn handle_ws_event(
             state.stats.engine_status = "disconnected".to_string();
         }
         WsEvent::Log { source, message, event_type } => {
-            if let Some(window) = state.get_window_mut(WindowId::Log) {
-                window.push_log(crate::windows::log::LogEntry {
-                    timestamp: String::new(),
-                    source,
-                    message,
-                    event_type,
-                });
-            }
+            crate::app::push_log_global(crate::windows::log::LogEntry {
+                timestamp: String::new(),
+                source,
+                message,
+                event_type,
+            });
         }
         WsEvent::StatsUpdate(mut stats) => {
             stats.engine_status = state.stats.engine_status.clone();
@@ -2192,7 +2191,7 @@ fn write_manifest_field(
 /// is `true`, and only a window whose selection is deliberately something else
 /// opts out.
 fn focused_selection_is_module(state: &AppState) -> bool {
-    match state.tree.window_by_id(state.active_window) {
+    match state.window_by_id(state.active_window) {
         Some(w) => w.selection_is_module(&state.stats),
         None => true,
     }
@@ -2211,7 +2210,7 @@ fn is_engine_scoped(action: &Action) -> bool {
 
 /// Whether the focused window's selection is the engine row.
 fn focused_selection_is_engine(state: &AppState) -> bool {
-    match state.tree.window_by_id(state.active_window) {
+    match state.window_by_id(state.active_window) {
         Some(w) => w.selection_is_engine(&state.stats),
         None => false,
     }
@@ -2220,7 +2219,7 @@ fn focused_selection_is_engine(state: &AppState) -> bool {
 /// The module currently selected in the active window.
 fn selected_module_name(state: &AppState) -> String {
     for (_, _, _, _) in state.tree.leaves() {
-        if let Some(w) = state.tree.window_by_id(state.active_window) {
+        if let Some(w) = state.window_by_id(state.active_window) {
             if let Some(name) = w.selected_module_name(&state.stats) {
                 return name;
             }
