@@ -53,11 +53,69 @@ impl ViewRegistry {
     }
 }
 
+/// A view module with no core of its OWN yet: it mints the existing window as
+/// its surface. Used while a view is being migrated onto a real core; once its
+/// data moves into a core it gets a dedicated module (like [`log::LogModule`]).
+struct SimpleModule {
+    id: &'static str,
+    title: &'static str,
+    make: fn() -> Box<dyn Window>,
+}
+
+impl ViewModule for SimpleModule {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn title(&self) -> &'static str {
+        self.title
+    }
+    fn make_surface(&self) -> Box<dyn Window> {
+        (self.make)()
+    }
+}
+
 /// Build the registry from every view module the TUI ships. Adding a view
 /// becomes "write the module + register it here" — no changes to the tree.
 fn build_registry() -> ViewRegistry {
     ViewRegistry {
-        modules: vec![Box::new(log::LogModule)],
+        modules: vec![
+            Box::new(log::LogModule),
+            Box::new(SimpleModule {
+                id: "logo",
+                title: "logo",
+                make: || Box::new(crate::windows::LogoWindow),
+            }),
+            Box::new(SimpleModule {
+                id: "modules",
+                title: "modules",
+                make: || Box::new(crate::windows::ModulesWindow::new()),
+            }),
+            Box::new(SimpleModule {
+                id: "chart",
+                title: "chart",
+                make: || Box::new(crate::windows::ChartWindow::new()),
+            }),
+            Box::new(SimpleModule {
+                id: "prompts",
+                title: "prompts",
+                make: || Box::new(crate::windows::PromptsWindow::new()),
+            }),
+            Box::new(SimpleModule {
+                id: "users",
+                title: "users",
+                make: || Box::new(crate::windows::UsersWindow::new()),
+            }),
+            Box::new(SimpleModule {
+                id: "stream_manager",
+                title: "stream manager",
+                make: || Box::new(crate::windows::StreamManagerWindow::new()),
+            }),
+            Box::new(SimpleModule {
+                id: "user_management",
+                title: "user management",
+                make: || Box::new(crate::windows::UserManagementWindow::new()),
+            }),
+        ],
     }
 }
 
