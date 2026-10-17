@@ -3463,7 +3463,7 @@ async fn dispatch_action(
                 state.active_window = WindowId::Modules;
                 supervisor_log(
                     state,
-                    "[supervisor] editing user-db config (j/k move, type to edit, Esc save+exit)",
+                    "[supervisor] editing user-db config (j/k move, Enter to edit, Esc save+exit)",
                 );
             }
         }
@@ -3483,7 +3483,7 @@ async fn dispatch_action(
                 state.active_window = WindowId::Modules;
                 supervisor_log(
                     state,
-                    "[supervisor] editing TUI config (j/k move, type to edit, Esc save+exit)",
+                    "[supervisor] editing TUI config (j/k move, Enter to edit, Esc save+exit)",
                 );
             }
         }
@@ -3512,7 +3512,7 @@ async fn dispatch_action(
                     if let Some(window) = state.get_window_mut(WindowId::Modules) {
                         window.start_config_editor(kind, &label, dir);
                         state.active_window = WindowId::Modules;
-                        supervisor_log(state, format!("[supervisor] editing config for {} (j/k move, type to edit, Esc save+exit)", label));
+                        supervisor_log(state, format!("[supervisor] editing config for {} (j/k move, Enter to edit, Esc save+exit)", label));
                     }
                 }
                 None => supervisor_log(state, format!("[supervisor] cannot edit config for '{}' — not a discovered module", name)),

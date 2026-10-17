@@ -889,6 +889,20 @@ enum RowKind {
     Group,
 }
 
+/// The JSON type a scalar row was loaded as.
+///
+/// Validation is driven by what the value WAS, not by re-guessing it from the
+/// text: a loaded number that the operator turns into "abc" must be refused as
+/// "not a valid number", even though "abc" would re-encode as a string. Only
+/// JSON rows carry a real kind; `.env` values and structural rows are `Str`
+/// (free-form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Str,
+    Number,
+    Bool,
+}
+
 /// One editable/structural row in the config editor.
 #[derive(Debug, Clone)]
 struct EditorRow {
@@ -902,6 +916,9 @@ struct EditorRow {
     /// `.env` rows are secrets — censored on screen.
     is_secret: bool,
     kind: RowKind,
+    /// The type the value was loaded as, used to validate an edit. See
+    /// [`ValueKind`].
+    orig_kind: ValueKind,
     /// Parent display label for "+" rows (used to name new children).
     add_base: String,
     /// The value this row was LOADED with, so a save can tell an actual edit
@@ -937,6 +954,10 @@ struct ConfigEditor {
     scroll: usize,
     /// Set after Esc is pressed: await y/n before saving (or discarding).
     confirm_save: bool,
+    /// True while the selected row's value is being typed into. In nav mode
+    /// (`false`) j/k/arrows move and Enter starts editing; in edit mode the
+    /// keys are handled literally so j/k/Enter can be typed.
+    edit_mode: bool,
 }
 
 /// How many lines of context the editor keeps between the cursor and the top or
@@ -956,8 +977,21 @@ enum EditorLine {
     Header { source: String },
     /// An editable row.
     Row { index: usize, prefix: String },
+    /// A continuation line of a multi-line value (line 1..N of the value, under
+    /// the row's first line). The row's own `Row` line is line 0.
+    RowCont { index: usize, prefix: String },
     /// The blank continuation line drawn under a row.
     Blank { prefix: String },
+}
+
+/// The number of display lines a row's value occupies (1 for a single-line
+/// value, or for a value that is not rendered as a multi-line scalar).
+fn row_value_line_count(row: &EditorRow) -> usize {
+    if row.kind == RowKind::Scalar && !row.is_secret && row.value.contains('\n') {
+        row.value.split('\n').count()
+    } else {
+        1
+    }
 }
 
 /// The full ordered list of display lines for `rows`.
@@ -986,11 +1020,161 @@ fn editor_lines(rows: &[EditorRow]) -> Vec<EditorLine> {
             index: i,
             prefix: prefix.clone(),
         });
+        // A visible, non-masked scalar with newlines gets one continuation
+        // display line per extra value line, so the tree grows to fit it.
+        for _ in 1..row_value_line_count(row) {
+            out.push(EditorLine::RowCont {
+                index: i,
+                prefix: prefix.clone(),
+            });
+        }
         if i + 1 < rows.len() {
             out.push(EditorLine::Blank { prefix });
         }
     }
     out
+}
+
+/// `(line, column)` of a cursor char-index within a value, counted in CHARS
+/// (not bytes) so multi-byte text and newlines behave.
+fn cursor_line_col(value: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in value.chars().enumerate() {
+        if i == cursor {
+            return (line, col);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Move a cursor char-index up/down within a multi-line value, keeping the
+/// column where it fits on the target line. A no-op when there is no line in
+/// that direction (which is the whole of the single-line behaviour).
+fn cursor_move_vertical(value: &str, cursor: usize, delta: isize) -> usize {
+    let lines: Vec<&str> = value.split('\n').collect();
+    let (line, col) = cursor_line_col(value, cursor);
+    let target = line as isize + delta;
+    if target < 0 || target as usize >= lines.len() {
+        return cursor;
+    }
+    let target = target as usize;
+    let mut idx = 0usize;
+    for l in &lines[..target] {
+        idx += l.chars().count() + 1; // +1 for the newline between lines.
+    }
+    idx + col.min(lines[target].chars().count())
+}
+
+/// The [`ValueKind`] a JSON scalar was loaded as. Anything that is not a
+/// string/number/bool (null, an object, an array) is treated as a free-form
+/// string, since there is no literal to validate against.
+fn value_kind(v: &serde_json::Value) -> ValueKind {
+    match v {
+        serde_json::Value::Number(_) => ValueKind::Number,
+        serde_json::Value::Bool(_) => ValueKind::Bool,
+        _ => ValueKind::Str,
+    }
+}
+
+/// The reason a **Scalar** row cannot be saved, or `None` when it is fine.
+///
+/// Only scalars are validated: groups and "+" rows do not hold a saved value
+/// yet. The rules follow what the save path can actually represent — an empty
+/// map key has nowhere to go, `.env` is line-oriented (a newline would split
+/// one setting into two), and a JSON number/bool has to re-encode as the type
+/// it was loaded as (see [`ValueKind`]). A JSON string is always valid.
+fn row_validation_error(row: &EditorRow) -> Option<String> {
+    if row.kind != RowKind::Scalar {
+        return None;
+    }
+    if let Some(Seg::Key(k)) = row.path.last() {
+        if k.trim().is_empty() {
+            return Some("empty key".to_string());
+        }
+    }
+    if row.source == "env" && row.value.contains('\n') {
+        return Some("a newline can't be stored in .env".to_string());
+    }
+    if row.source == "json" {
+        match row.orig_kind {
+            ValueKind::Number => {
+                if row.value.contains('\n') {
+                    return Some("a newline isn't valid in a number".to_string());
+                }
+                if row.value.trim().parse::<f32>().is_err() {
+                    return Some("not a valid number".to_string());
+                }
+            }
+            ValueKind::Bool => {
+                if row.value.contains('\n') {
+                    return Some("a newline isn't valid in a boolean".to_string());
+                }
+                let t = row.value.trim();
+                if t != "true" && t != "false" {
+                    return Some("not a valid boolean (true/false)".to_string());
+                }
+            }
+            ValueKind::Str => {}
+        }
+    }
+    None
+}
+
+/// Every invalid scalar row as `(row index, message)`. Drives both the red
+/// highlight while editing and the save-time warning.
+fn invalid_rows(rows: &[EditorRow]) -> Vec<(usize, String)> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, r)| row_validation_error(r).map(|e| (i, e)))
+        .collect()
+}
+
+/// A human path label for a row, e.g. `inputs[2].port`.
+fn path_display(path: &[Seg]) -> String {
+    let mut s = String::new();
+    for seg in path {
+        match seg {
+            Seg::Key(k) => {
+                if !s.is_empty() {
+                    s.push('.');
+                }
+                s.push_str(k);
+            }
+            Seg::Idx(i) => s.push_str(&format!("[{}]", i)),
+        }
+    }
+    s
+}
+
+/// A one-line summary of every invalid row, for the save-confirmation banner,
+/// or `None` when nothing is wrong. The list is capped so the banner stays one
+/// line; the count is always exact.
+fn invalid_summary(rows: &[EditorRow]) -> Option<String> {
+    let invalid = invalid_rows(rows);
+    if invalid.is_empty() {
+        return None;
+    }
+    const CAP: usize = 4;
+    let mut parts: Vec<String> = invalid
+        .iter()
+        .take(CAP)
+        .map(|(i, e)| format!("\"{}\" {}", path_display(&rows[*i].path), e))
+        .collect();
+    if invalid.len() > CAP {
+        parts.push(format!("and {} more", invalid.len() - CAP));
+    }
+    Some(format!(
+        "{} invalid value(s): {}",
+        invalid.len(),
+        parts.join("; ")
+    ))
 }
 
 /// The display-line index of the selected row.
@@ -1111,6 +1295,7 @@ impl ModulesWindow {
                         cursor: 0,
                         is_secret: false,
                         kind: RowKind::Group,
+                        orig_kind: ValueKind::Str,
                         add_base: String::new(),
                         original: String::new(),
                     });
@@ -1128,6 +1313,7 @@ impl ModulesWindow {
                     cursor: 0,
                     is_secret: false,
                     kind: RowKind::AddMap,
+                    orig_kind: ValueKind::Str,
                     add_base: display.clone(),
                     original: String::new(),
                 });
@@ -1141,6 +1327,7 @@ impl ModulesWindow {
                         cursor: 0,
                         is_secret: false,
                         kind: RowKind::Group,
+                        orig_kind: ValueKind::Str,
                         add_base: String::new(),
                         original: String::new(),
                     });
@@ -1158,6 +1345,7 @@ impl ModulesWindow {
                     cursor: 0,
                     is_secret: false,
                     kind: RowKind::AddList,
+                    orig_kind: ValueKind::Str,
                     add_base: display.clone(),
                     original: String::new(),
                 });
@@ -1171,6 +1359,7 @@ impl ModulesWindow {
                     cursor: value.chars().count(),
                     is_secret: false,
                     kind: RowKind::Scalar,
+                    orig_kind: value_kind(other),
                     add_base: String::new(),
                     original: value.clone(),
                 });
@@ -1197,6 +1386,7 @@ impl ModulesWindow {
                         cursor: value.chars().count(),
                         is_secret: true,
                         kind: RowKind::Scalar,
+                        orig_kind: ValueKind::Str,
                         add_base: String::new(),
                         original: value.clone(),
                     });
@@ -1211,6 +1401,7 @@ impl ModulesWindow {
             cursor: 0,
             is_secret: false,
             kind: RowKind::AddMap,
+            orig_kind: ValueKind::Str,
             add_base: String::new(),
             original: String::new(),
         });
@@ -1228,6 +1419,7 @@ impl ModulesWindow {
                                     cursor: 0,
                                     is_secret: false,
                                     kind: RowKind::Group,
+                                    orig_kind: ValueKind::Str,
                                     add_base: String::new(),
                                     original: String::new(),
                                 });
@@ -1246,6 +1438,7 @@ impl ModulesWindow {
                                     cursor: 0,
                                     is_secret: false,
                                     kind: RowKind::AddMap,
+                                    orig_kind: ValueKind::Str,
                                     add_base: String::new(),
                                     original: String::new(),
                                 });
@@ -1264,6 +1457,7 @@ impl ModulesWindow {
             cursor: 0,
             is_secret: false,
             kind: RowKind::AddMap,
+            orig_kind: ValueKind::Str,
             add_base: String::new(),
             original: String::new(),
         });
@@ -1434,6 +1628,127 @@ fn row_label(row: &EditorRow) -> String {
     }
 }
 
+/// Draw one display line of an editor row.
+///
+/// `line_no` is the value line to draw (`0` for the row's own line, `n` for a
+/// continuation of a multi-line value) and `continuation` indents it under the
+/// value column and omits the label. The cursor block is drawn only while
+/// `edit_mode` is on and only on the value line the cursor is actually on.
+#[allow(clippy::too_many_arguments)]
+fn render_editor_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    row: &EditorRow,
+    prefix: &str,
+    is_selected: bool,
+    edit_mode: bool,
+    invalid: bool,
+    line_no: usize,
+    continuation: bool,
+) {
+    let is_add = matches!(row.kind, RowKind::AddMap | RowKind::AddList);
+    let is_group = row.kind == RowKind::Group;
+    let label = Self::row_label(row);
+    let masked = row.is_secret;
+    let row_style = if is_selected {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else if is_group {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else if is_add {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    // An invalid value is painted red; a selected row keeps its cyan selection
+    // background behind the red text.
+    let content_style = if invalid {
+        row_style.fg(Color::Red)
+    } else {
+        row_style
+    };
+    let label_style = if invalid {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let mut spans = vec![Span::styled(
+        prefix.to_string(),
+        Style::default().fg(Color::DarkGray),
+    )];
+
+    if is_group {
+        // Non-editable object/array key.
+        spans.push(Span::styled(label, content_style));
+    } else if is_add {
+        // "+" row: show "+" plus any pending input. The cursor block appears
+        // only while editing, so nav mode shows the pending text plainly.
+        let plus_style = if is_selected {
+            row_style.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        let chars: Vec<char> = row.value.chars().collect();
+        let pos = row.cursor.min(chars.len());
+        let b: String = chars[..pos].iter().collect();
+        let a: String = chars[pos..].iter().collect();
+        spans.push(Span::styled("+", plus_style));
+        if !row.value.is_empty() {
+            if is_selected && edit_mode {
+                spans.push(Span::styled(b, content_style));
+                spans.push(Span::styled(
+                    "\u{2588}",
+                    Style::default().fg(Color::White).bg(Color::Red),
+                ));
+                spans.push(Span::styled(a, content_style));
+            } else {
+                spans.push(Span::styled(
+                    format!("{}{}", b, a),
+                    if invalid { content_style } else { Style::default().fg(Color::Green) },
+                ));
+            }
+        }
+    } else if masked {
+        // `.env` secrets: always censored.
+        spans.push(if !label.is_empty() {
+            Span::styled(format!("{} : ", label), content_style)
+        } else {
+            Span::raw("")
+        });
+        spans.push(Span::styled("*****", content_style));
+    } else {
+        // `config.json`: a visible value, split across `line_no`.
+        if !continuation && !label.is_empty() {
+            spans.push(Span::styled(format!("{} : ", label), label_style));
+        }
+        if continuation {
+            // Indent the value's later lines under its first line.
+            spans.push(Span::raw("  "));
+        }
+        let value_lines: Vec<&str> = row.value.split('\n').collect();
+        let text = value_lines.get(line_no).copied().unwrap_or("");
+        let (cline, ccol) = cursor_line_col(&row.value, row.cursor);
+        let chars: Vec<char> = text.chars().collect();
+        let pos = ccol.min(chars.len());
+        if edit_mode && is_selected && cline == line_no {
+            let b: String = chars[..pos].iter().collect();
+            let a: String = chars[pos..].iter().collect();
+            spans.push(Span::styled(b, content_style));
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default().fg(Color::White).bg(Color::Red),
+            ));
+            spans.push(Span::styled(a, content_style));
+        } else {
+            spans.push(Span::styled(text.to_string(), content_style));
+        }
+    }
+
+    let line = Line::from(spans);
+    line.render(Rect { x: area.x, y, width: area.width, height: 1 }, buf);
+}
+
 /// Render the config editor as a tree: `.env` (censored) and `config.json`
 /// (visible) sections, `key : value` rows, `+` rows for maps/arrays/files.
 fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, colors: &ColorConfig, prompts: &[PendingPrompt]) {
@@ -1470,19 +1785,35 @@ fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, color
         }
 
         if y < inner.y + inner.height {
-            let help = if ed.confirm_save {
-                " Save changes?  y = save & exit   n = discard & exit   Esc = keep editing "
+            if ed.confirm_save {
+                let line = Line::from(Span::styled(
+                    " Save changes?  y = save & exit   n = discard & exit   Esc = keep editing ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+                line.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+                y += 1;
+                // Name the offending rows, so "y" is a knowing choice rather
+                // than a blind overwrite: the save still goes through.
+                if let Some(warning) = invalid_summary(&ed.rows) {
+                    if y < inner.y + inner.height {
+                        let line = Line::from(Span::styled(
+                            format!(" \u{26a0} {}", warning),
+                            Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD),
+                        ));
+                        line.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+                        y += 1;
+                    }
+                }
             } else {
-                " \u{2191}/\u{2193} or j/k move \u{00b7} type to edit \u{00b7} Enter commit/add \u{00b7} Esc save & exit "
-            };
-            let style = if ed.confirm_save {
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let line = Line::from(Span::styled(help, style));
-            line.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
-            y += 1;
+                let help = if ed.edit_mode {
+                    " Enter finish \u{00b7} Shift+Enter newline \u{00b7} Esc stop "
+                } else {
+                    " \u{2191}/\u{2193} or j/k move \u{00b7} Enter edit \u{00b7} Esc save & exit "
+                };
+                let line = Line::from(Span::styled(help, Style::default().fg(Color::DarkGray)));
+                line.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+                y += 1;
+            }
         }
 
         let visible = (inner.y + inner.height).saturating_sub(y) as usize;
@@ -1497,7 +1828,22 @@ fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, color
             total,
         );
 
-        for line in &lines[ed.scroll..] {
+        let invalid: std::collections::HashSet<usize> = invalid_rows(&ed.rows)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        // Counts the continuation lines seen per row so a `RowCont` knows which
+        // value line it is drawing, even when scrolled into the middle of a
+        // multi-line value (the counter walks from line 0, not from the top of
+        // the viewport).
+        let mut cont_no: HashMap<usize, usize> = HashMap::new();
+        for (pos, line) in lines.iter().enumerate() {
+            if pos < ed.scroll {
+                if let EditorLine::RowCont { index, .. } = line {
+                    *cont_no.entry(*index).or_insert(0) += 1;
+                }
+                continue;
+            }
             if y >= inner.y + inner.height {
                 break;
             }
@@ -1528,91 +1874,41 @@ fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, color
                     let i = *index;
                     let row = &ed.rows[i];
                     let is_selected = i == ed.selected && is_active;
-                    let is_add = matches!(row.kind, RowKind::AddMap | RowKind::AddList);
-                    let is_group = row.kind == RowKind::Group;
-                    let label = Self::row_label(row);
-                    let masked = row.is_secret;
-                    let row_style = if is_selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
-                    } else if is_group {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                    } else if is_add {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::White)
+                    Self::render_editor_row(
+                        buf,
+                        Rect { x: inner.x, y, width: inner.width, height: 1 },
+                        y,
+                        row,
+                        prefix,
+                        is_selected,
+                        ed.edit_mode,
+                        invalid.contains(&i),
+                        0,
+                        false,
+                    );
+                    y += 1;
+                }
+                EditorLine::RowCont { index, prefix } => {
+                    let i = *index;
+                    let row = &ed.rows[i];
+                    let is_selected = i == ed.selected && is_active;
+                    let line_no = {
+                        let e = cont_no.entry(i).or_insert(0);
+                        *e += 1;
+                        *e
                     };
-
-                    let mut spans = vec![Span::styled(
-                        prefix.clone(),
-                        Style::default().fg(Color::DarkGray),
-                    )];
-
-                    if is_group {
-                        // Non-editable object/array key.
-                        spans.push(Span::styled(label, row_style));
-                    } else if is_add {
-                        // "+" row: show "+" plus any pending input. Highlight the "+"
-                        // itself when the row is selected so the cursor is obvious.
-                        let plus_style = if is_selected {
-                            row_style.add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                        };
-                        let chars: Vec<char> = row.value.chars().collect();
-                        let pos = row.cursor.min(chars.len());
-                        let b: String = chars[..pos].iter().collect();
-                        let a: String = chars[pos..].iter().collect();
-                        spans.push(Span::styled("+", plus_style));
-                        if !row.value.is_empty() {
-                            if is_selected {
-                                spans.push(Span::styled(b, row_style));
-                                spans.push(Span::styled(
-                                    "\u{2588}",
-                                    Style::default().fg(Color::White).bg(Color::Red),
-                                ));
-                                spans.push(Span::styled(a, row_style));
-                            } else {
-                                spans.push(Span::styled(
-                                    format!("{}{}", b, a),
-                                    Style::default().fg(Color::Green),
-                                ));
-                            }
-                        }
-                    } else if masked {
-                        // `.env` secrets: always censored.
-                        spans.push(if !label.is_empty() {
-                            Span::styled(format!("{} : ", label), row_style)
-                        } else {
-                            Span::raw("")
-                        });
-                        spans.push(Span::styled("*****", row_style));
-                    } else {
-                        // `config.json`: visible value with a cursor block on the
-                        // selected row.
-                        if !label.is_empty() {
-                            spans.push(Span::styled(
-                                format!("{} : ", label),
-                                Style::default().fg(Color::White),
-                            ));
-                        }
-                        let chars: Vec<char> = row.value.chars().collect();
-                        let pos = row.cursor.min(chars.len());
-                        let b: String = chars[..pos].iter().collect();
-                        let a: String = chars[pos..].iter().collect();
-                        if is_selected {
-                            spans.push(Span::styled(b, row_style));
-                            spans.push(Span::styled(
-                                "\u{2588}",
-                                Style::default().fg(Color::White).bg(Color::Red),
-                            ));
-                            spans.push(Span::styled(a, row_style));
-                        } else {
-                            spans.push(Span::styled(format!("{}{}", b, a), row_style));
-                        }
-                    }
-
-                    let line = Line::from(spans);
-                    line.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
+                    Self::render_editor_row(
+                        buf,
+                        Rect { x: inner.x, y, width: inner.width, height: 1 },
+                        y,
+                        row,
+                        prefix,
+                        is_selected,
+                        ed.edit_mode,
+                        invalid.contains(&i),
+                        line_no,
+                        true,
+                    );
                     y += 1;
                 }
             }
@@ -2872,6 +3168,7 @@ impl Window for ModulesWindow {
             selected: 0,
             scroll: 0,
             confirm_save: false,
+            edit_mode: false,
         });
     }
 
@@ -3017,6 +3314,116 @@ fn editor_key(&mut self, key: crossterm::event::KeyEvent, hotkeys: &HotkeyConfig
             }
         }
 
+        // Edit mode: the hotkey map is bypassed entirely so j/k/Enter/arrows
+        // are handled literally (a `j` types a `j`).
+        if ed.edit_mode {
+            if !ed.rows.is_empty() {
+                let idx = ed.selected;
+                let editable = ed.rows[idx].kind != RowKind::Group;
+                match key.code {
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        // Shift+Enter inserts a newline (multi-line value).
+                        if editable {
+                            let row = &mut ed.rows[idx];
+                            let mut chars: Vec<char> = row.value.chars().collect();
+                            let pos = row.cursor.min(chars.len());
+                            chars.insert(pos, '\n');
+                            row.value = chars.into_iter().collect();
+                            row.cursor = pos + 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // Finish editing. Clamp the cursor, and a "+" row still
+                        // commits its pending input. Selection stays put.
+                        if editable {
+                            ed.rows[idx].cursor = ed.rows[idx].value.chars().count();
+                            match ed.rows[idx].kind {
+                                RowKind::AddMap => Self::commit_add_map(&mut ed.rows, idx),
+                                RowKind::AddList => Self::commit_add_list(&mut ed.rows, idx),
+                                _ => {}
+                            }
+                        }
+                        ed.edit_mode = false;
+                    }
+                    KeyCode::Esc => {
+                        // Stop editing but KEEP the value (no revert).
+                        ed.edit_mode = false;
+                    }
+                    KeyCode::Left => {
+                        if editable {
+                            ed.rows[idx].cursor = ed.rows[idx].cursor.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Right => {
+                        if editable {
+                            let row = &mut ed.rows[idx];
+                            row.cursor = (row.cursor + 1).min(row.value.chars().count());
+                        }
+                    }
+                    KeyCode::Up => {
+                        if editable {
+                            let row = &mut ed.rows[idx];
+                            row.cursor = cursor_move_vertical(&row.value, row.cursor, -1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if editable {
+                            let row = &mut ed.rows[idx];
+                            row.cursor = cursor_move_vertical(&row.value, row.cursor, 1);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if editable {
+                            let empty = ed.rows[idx].value.is_empty();
+                            let cursor = ed.rows[idx].cursor;
+                            let is_scalar = ed.rows[idx].kind == RowKind::Scalar;
+                            if empty && is_scalar && cursor == 0 {
+                                // Backspace on an empty scalar still removes the
+                                // row (map key / env var / array element).
+                                Self::remove_scalar_row(&mut ed.rows, idx);
+                                ed.selected = idx.min(ed.rows.len().saturating_sub(1));
+                            } else {
+                                let row = &mut ed.rows[idx];
+                                let mut chars: Vec<char> = row.value.chars().collect();
+                                let pos = row.cursor.min(chars.len());
+                                if pos > 0 {
+                                    chars.remove(pos - 1);
+                                    row.value = chars.into_iter().collect();
+                                    row.cursor = pos - 1;
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if editable {
+                            let row = &mut ed.rows[idx];
+                            let mut chars: Vec<char> = row.value.chars().collect();
+                            if row.cursor < chars.len() {
+                                chars.remove(row.cursor);
+                                row.value = chars.into_iter().collect();
+                            }
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if editable
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        let row = &mut ed.rows[idx];
+                        let mut chars: Vec<char> = row.value.chars().collect();
+                        let pos = row.cursor.min(chars.len());
+                        chars.insert(pos, c);
+                        row.value = chars.into_iter().collect();
+                        row.cursor = pos + 1;
+                    }
+                    _ => {}
+                }
+            }
+            self.editing = Some(ed);
+            return true;
+        }
+
+        // Nav mode: the hotkey map decides what a key means.
         match hotkeys.editor_action(&key) {
             Some(EditorAction::SaveExit) => {
                 ed.confirm_save = true;
@@ -3035,90 +3442,27 @@ fn editor_key(&mut self, key: crossterm::event::KeyEvent, hotkeys: &HotkeyConfig
                 self.editing = Some(ed);
                 true
             }
-            Some(EditorAction::CursorLeft) => {
-                if !ed.rows.is_empty() && ed.rows[ed.selected].kind != RowKind::Group {
-                    ed.rows[ed.selected].cursor = ed.rows[ed.selected].cursor.saturating_sub(1);
-                }
-                self.editing = Some(ed);
-                true
-            }
-            Some(EditorAction::CursorRight) => {
-                if !ed.rows.is_empty() && ed.rows[ed.selected].kind != RowKind::Group {
-                    let row = &mut ed.rows[ed.selected];
-                    row.cursor = (row.cursor + 1).min(row.value.chars().count());
-                }
+            // The cursor is only drawn while editing, so ←/→ are no-ops here.
+            Some(EditorAction::CursorLeft) | Some(EditorAction::CursorRight) => {
                 self.editing = Some(ed);
                 true
             }
             Some(EditorAction::Commit) => {
-                if ed.rows.is_empty() {
-                    self.editing = Some(ed);
-                    return true;
-                }
-                let idx = ed.selected;
-                match ed.rows[idx].kind {
-                    RowKind::AddMap => Self::commit_add_map(&mut ed.rows, idx),
-                    RowKind::AddList => Self::commit_add_list(&mut ed.rows, idx),
-                    _ => {
-                        // Commit current value and move down (groups just move).
+                // Enter STARTS editing a scalar / "+" row, at the end of the
+                // value. A group has nothing to edit.
+                if !ed.rows.is_empty() {
+                    let idx = ed.selected;
+                    if ed.rows[idx].kind != RowKind::Group {
                         ed.rows[idx].cursor = ed.rows[idx].value.chars().count();
-                        ed.selected = (idx + 1).min(ed.rows.len() - 1);
+                        ed.edit_mode = true;
                     }
                 }
                 self.editing = Some(ed);
                 true
             }
             None => {
-                // Text editing on the selected row (scalar or "+" input).
-                match key.code {
-                    KeyCode::Backspace => {
-                        if !ed.rows.is_empty() && ed.rows[ed.selected].kind != RowKind::Group {
-                            let empty = ed.rows[ed.selected].value.is_empty();
-                            let cursor = ed.rows[ed.selected].cursor;
-                            let is_scalar = ed.rows[ed.selected].kind == RowKind::Scalar;
-                            if empty && is_scalar && cursor == 0 {
-                                // Backspace on an empty value removes the row
-                                // (map key / env var / array element).
-                                let idx = ed.selected;
-                                Self::remove_scalar_row(&mut ed.rows, idx);
-                                ed.selected = idx.min(ed.rows.len().saturating_sub(1));
-                            } else {
-                                let row = &mut ed.rows[ed.selected];
-                                let mut chars: Vec<char> = row.value.chars().collect();
-                                let pos = row.cursor.min(chars.len());
-                                if pos > 0 {
-                                    chars.remove(pos - 1);
-                                    row.value = chars.into_iter().collect();
-                                    row.cursor = pos - 1;
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if !ed.rows.is_empty() && ed.rows[ed.selected].kind != RowKind::Group {
-                            let row = &mut ed.rows[ed.selected];
-                            let mut chars: Vec<char> = row.value.chars().collect();
-                            if row.cursor < chars.len() {
-                                chars.remove(row.cursor);
-                                row.value = chars.into_iter().collect();
-                            }
-                        }
-                    }
-                    KeyCode::Char(c)
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key.modifiers.contains(KeyModifiers::ALT) =>
-                    {
-                        if !ed.rows.is_empty() && ed.rows[ed.selected].kind != RowKind::Group {
-                            let row = &mut ed.rows[ed.selected];
-                            let mut chars: Vec<char> = row.value.chars().collect();
-                            let pos = row.cursor.min(chars.len());
-                            chars.insert(pos, c);
-                            row.value = chars.into_iter().collect();
-                            row.cursor = pos + 1;
-                        }
-                    }
-                    _ => {}
-                }
+                // A printable key that is not a navigation binding does NOTHING
+                // in nav mode: the operator must press Enter first.
                 self.editing = Some(ed);
                 true
             }
@@ -3130,6 +3474,8 @@ fn editor_key(&mut self, key: crossterm::event::KeyEvent, hotkeys: &HotkeyConfig
             return false;
         }
         let mut ed = self.editing.take().unwrap();
+        // A paste is an edit: enter edit mode so the value stays live.
+        ed.edit_mode = true;
         if !ed.rows.is_empty() {
             let row = &mut ed.rows[ed.selected];
             let mut chars: Vec<char> = row.value.chars().collect();
@@ -3287,11 +3633,14 @@ SECRET=s3
         while w.editing.as_ref().unwrap().selected < add_idx {
             w.editor_key(key('j'), &hk);
         }
-        // Type a new channel and commit.
+        // Enter edit mode, type a new channel, then Enter commits the "+" row.
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(w.editing.as_ref().unwrap().edit_mode, "Enter must start editing");
         for c in "ch3".chars() {
             w.editor_key(key(c), &hk);
         }
         w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(!w.editing.as_ref().unwrap().edit_mode, "Enter must finish editing");
         // The new element row exists now.
         let rows2 = path_str(&w.editing.as_ref().unwrap().rows);
         assert!(rows2.iter().any(|d| d.ends_with("[2]")), "rows2: {:?}", rows2);
@@ -3703,12 +4052,16 @@ SECRET=s3
         w.start_config_editor(ConfigTarget::Module, "test-mod", tmp.clone());
         let hk = default_hotkeys();
 
-        // Edit a value.
+        // Edit a value: Enter starts editing, Enter again finishes it.
         w.editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &hk);
         w.editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &hk);
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(w.editing.as_ref().unwrap().edit_mode, "Enter must start editing");
         for c in "MODIFIED".chars() {
             w.editor_key(key(c), &hk);
         }
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(!w.editing.as_ref().unwrap().edit_mode, "Enter must finish editing");
         // Esc → n discards: editor exits, file untouched.
         w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
         assert!(w.in_editor(), "should await confirmation");
@@ -3803,10 +4156,14 @@ SECRET=s3
         while w.editing.as_ref().unwrap().selected < model_idx {
             w.editor_key(key('j'), &hk);
         }
+        // Enter starts editing; clear "mms" then backspace once more to remove
+        // the now-empty row, then stop editing (Esc keeps the value).
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
         for _ in 0.."mms".chars().count() {
             w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
         }
         w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
+        w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
         assert!(
             !w.editing.as_ref().unwrap().rows.iter().any(|r| r.path.last() == Some(&super::Seg::Key("model".into()))),
             "model row should be removed"
@@ -3832,9 +4189,12 @@ SECRET=s3
                 break;
             }
         }
-        // Clear "a" then backspace again to remove the now-empty row.
+        // Enter to edit, clear "a" then backspace again to remove the empty
+        // row, then stop editing.
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
         w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
         w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
+        w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
         let remaining: Vec<usize> = w
             .editing
             .as_ref()
@@ -3858,13 +4218,172 @@ SECRET=s3
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// In edit mode the letters `j`/`k` are text, not navigation; in nav mode
+    /// they still move the selection. This is the whole point of the mode.
+    #[test]
+    fn edit_mode_types_j_and_k_while_nav_moves() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-jk-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"model":"mms"}"#).unwrap();
+
+        let mut w = ModulesWindow::new();
+        w.start_config_editor(ConfigTarget::Module, "test-mod", tmp.clone());
+        let hk = default_hotkeys();
+
+        // Nav mode: j/k move.
+        let start = w.editing.as_ref().unwrap().selected;
+        w.editor_key(key('j'), &hk);
+        assert_eq!(
+            w.editing.as_ref().unwrap().selected,
+            start + 1,
+            "j must move down in nav mode"
+        );
+        w.editor_key(key('k'), &hk);
+        assert_eq!(
+            w.editing.as_ref().unwrap().selected,
+            start,
+            "k must move up in nav mode"
+        );
+
+        // Select the `model` scalar and start editing.
+        let model_idx = w
+            .editing
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|r| r.kind == super::RowKind::Scalar
+                && r.path.last() == Some(&super::Seg::Key("model".into())))
+            .unwrap();
+        while w.editing.as_ref().unwrap().selected < model_idx {
+            w.editor_key(key('j'), &hk);
+        }
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert!(w.editing.as_ref().unwrap().edit_mode);
+
+        // Edit mode: j/k are inserted literally and do NOT move the selection.
+        w.editor_key(key('j'), &hk);
+        w.editor_key(key('k'), &hk);
+        let sel = w.editing.as_ref().unwrap().selected;
+        let row = &w.editing.as_ref().unwrap().rows[sel];
+        assert_eq!(row.value, "mmsjk", "j/k must be typed literally in edit mode");
+        assert_eq!(row.cursor, row.value.chars().count());
+        assert_eq!(sel, model_idx, "typing must not move the selection");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Shift+Enter inserts a newline, and a committed multi-line value is what
+    /// gets written on save.
+    #[test]
+    fn shift_enter_makes_a_multiline_value_that_round_trips() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-multiline-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"model":"mms"}"#).unwrap();
+
+        let mut w = ModulesWindow::new();
+        w.start_config_editor(ConfigTarget::Module, "test-mod", tmp.clone());
+        let hk = default_hotkeys();
+
+        let model_idx = w
+            .editing
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|r| r.kind == super::RowKind::Scalar
+                && r.path.last() == Some(&super::Seg::Key("model".into())))
+            .unwrap();
+        while w.editing.as_ref().unwrap().selected < model_idx {
+            w.editor_key(key('j'), &hk);
+        }
+        // Enter, Shift+Enter, "next", Enter.
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &hk);
+        for c in "next".chars() {
+            w.editor_key(key(c), &hk);
+        }
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert_eq!(
+            w.editing.as_ref().unwrap().rows[model_idx].value,
+            "mms\nnext",
+            "Shift+Enter must insert a newline"
+        );
+
+        // Esc → confirm → y writes the multi-line value back.
+        w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
+        w.editor_key(key('y'), &hk);
+        assert!(!w.in_editor());
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("config.json")).unwrap()).unwrap();
+        assert_eq!(cfg["model"], "mms\nnext", "cfg: {}", cfg);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Saving is still allowed with an invalid row: `y` writes whatever was
+    /// typed. The banner names the offending row so the choice is informed.
+    #[test]
+    fn save_with_an_invalid_row_still_writes_on_y() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-invalid-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"port":9734}"#).unwrap();
+
+        let mut w = ModulesWindow::new();
+        w.start_config_editor(ConfigTarget::Module, "test-mod", tmp.clone());
+        let hk = default_hotkeys();
+
+        let port_idx = w
+            .editing
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .position(|r| r.kind == super::RowKind::Scalar
+                && r.path.last() == Some(&super::Seg::Key("port".into())))
+            .unwrap();
+        while w.editing.as_ref().unwrap().selected < port_idx {
+            w.editor_key(key('j'), &hk);
+        }
+        // Enter, clear "9734", type "abc" (no longer a number), Enter.
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        for _ in 0..4 {
+            w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
+        }
+        for c in "abc".chars() {
+            w.editor_key(key(c), &hk);
+        }
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
+        assert_eq!(w.editing.as_ref().unwrap().rows[port_idx].value, "abc");
+
+        // The row is invalid and the warning names it.
+        let warning = super::invalid_summary(&w.editing.as_ref().unwrap().rows).expect("invalid");
+        assert!(warning.contains("port"), "warning: {}", warning);
+        assert!(warning.contains("not a valid number"), "warning: {}", warning);
+
+        // Esc → confirm, then y saves anyway.
+        w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
+        assert!(w.editing.as_ref().unwrap().confirm_save);
+        w.editor_key(key('y'), &hk);
+        assert!(!w.in_editor());
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("config.json")).unwrap()).unwrap();
+        // `json_value` re-encodes "abc" as a string; the point is the typed
+        // text was written, not rejected.
+        assert_eq!(cfg["port"], "abc", "cfg: {}", cfg);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 #[cfg(test)]
 mod editor_scroll_tests {
     use super::{
         editor_lines, editor_scroll_for, editor_selected_line, EditorLine, EditorRow, ModulesWindow,
-        RowKind, Seg, EDITOR_SCROLL_MARGIN,
+        RowKind, Seg, ValueKind, EDITOR_SCROLL_MARGIN,
     };
     use crate::app::ConfigTarget;
 
@@ -3876,6 +4395,7 @@ mod editor_scroll_tests {
             cursor: 0,
             is_secret: source == "env",
             kind: RowKind::Scalar,
+            orig_kind: ValueKind::Str,
             add_base: String::new(),
             original: "v".to_string(),
         }
@@ -4151,6 +4671,111 @@ mod editor_scroll_tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A multi-line scalar costs one `Row` line plus a `RowCont` per extra
+    /// value line; a single-line or masked value never expands.
+    #[test]
+    fn a_multiline_value_expands_into_continuation_lines() {
+        let mut multi = row("json", 0);
+        multi.value = "a\nb\nc".to_string();
+        let lines = editor_lines(&[multi]);
+        assert_eq!(
+            lines.iter().filter(|l| matches!(l, EditorLine::Row { .. })).count(),
+            1,
+            "one row line"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| matches!(l, EditorLine::RowCont { .. })).count(),
+            2,
+            "two continuation lines for a three-line value"
+        );
+        // The selected row still resolves to its first (`Row`) line.
+        assert!(matches!(
+            lines[editor_selected_line(&lines, 0)],
+            EditorLine::Row { index: 0, .. }
+        ));
+
+        // A single-line value has no continuation lines.
+        let one = editor_lines(&[row("json", 0)]);
+        assert_eq!(
+            one.iter().filter(|l| matches!(l, EditorLine::RowCont { .. })).count(),
+            0
+        );
+
+        // A masked `.env` scalar never expands, even with a newline in it.
+        let mut secret = row("env", 0);
+        secret.value = "a\nb".to_string();
+        let masked = editor_lines(&[secret]);
+        assert_eq!(
+            masked.iter().filter(|l| matches!(l, EditorLine::RowCont { .. })).count(),
+            0,
+            "secrets stay one line"
+        );
+    }
+
+    /// The validation rule per [`ValueKind`], plus that non-scalars are exempt.
+    #[test]
+    fn row_validation_error_accepts_valid_and_rejects_invalid() {
+        use super::row_validation_error;
+        fn scalar(source: &str, seg: Seg, value: &str, kind: ValueKind) -> EditorRow {
+            EditorRow {
+                source: source.to_string(),
+                path: vec![seg],
+                value: value.to_string(),
+                cursor: 0,
+                is_secret: source == "env",
+                kind: RowKind::Scalar,
+                orig_kind: kind,
+                add_base: String::new(),
+                original: String::new(),
+            }
+        }
+        let key = |k: &str| Seg::Key(k.to_string());
+
+        // `.env` cannot hold a newline.
+        assert!(
+            row_validation_error(&scalar("env", key("K"), "a\nb", ValueKind::Str)).is_some(),
+            "an env newline must be invalid"
+        );
+        // A JSON number must stay numeric.
+        assert_eq!(
+            row_validation_error(&scalar("json", key("port"), "abc", ValueKind::Number)).as_deref(),
+            Some("not a valid number")
+        );
+        assert_eq!(
+            row_validation_error(&scalar("json", key("port"), "1\n2", ValueKind::Number)).as_deref(),
+            Some("a newline isn't valid in a number")
+        );
+        // A JSON bool must be true/false.
+        assert_eq!(
+            row_validation_error(&scalar("json", key("b"), "yes", ValueKind::Bool)).as_deref(),
+            Some("not a valid boolean (true/false)")
+        );
+        assert_eq!(
+            row_validation_error(&scalar("json", key("b"), "true\n", ValueKind::Bool)).as_deref(),
+            Some("a newline isn't valid in a boolean")
+        );
+        // An empty map key has nowhere to go.
+        assert_eq!(
+            row_validation_error(&scalar("json", key("   "), "x", ValueKind::Str)).as_deref(),
+            Some("empty key")
+        );
+
+        // Valid cases.
+        assert!(row_validation_error(&scalar("json", key("port"), "9734", ValueKind::Number)).is_none());
+        assert!(row_validation_error(&scalar("json", key("b"), "true", ValueKind::Bool)).is_none());
+        assert!(row_validation_error(&scalar("json", key("b"), "false", ValueKind::Bool)).is_none());
+        assert!(row_validation_error(&scalar("json", key("s"), "a\nb", ValueKind::Str)).is_none());
+        assert!(row_validation_error(&scalar("env", key("K"), "v", ValueKind::Str)).is_none());
+
+        // Groups and "+" rows are not validated.
+        let mut group = scalar("json", key(""), "", ValueKind::Str);
+        group.kind = RowKind::Group;
+        assert!(row_validation_error(&group).is_none());
+        let mut add = scalar("json", key(""), "", ValueKind::Number);
+        add.kind = RowKind::AddMap;
+        assert!(row_validation_error(&add).is_none());
     }
 }
 
@@ -5510,12 +6135,15 @@ mod engine_row_tests {
         {
             w.editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &hk);
         }
+        // Enter to edit, replace the PIN, then Enter to finish; Esc → confirm.
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
         for _ in 0.."123456".len() {
             w.editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()), &hk);
         }
         for c in "9999".chars() {
             w.editor_key(key(c), &hk);
         }
+        w.editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &hk);
         w.editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &hk);
         w.editor_key(key('y'), &hk);
         assert!(!w.in_editor());
@@ -5672,6 +6300,7 @@ mod engine_row_tests {
             cursor: 0,
             is_secret: false,
             kind: super::RowKind::Scalar,
+            orig_kind: super::ValueKind::Str,
             add_base: String::new(),
             original: "a".into(),
         }];
@@ -5707,6 +6336,7 @@ mod engine_row_tests {
             cursor: 0,
             is_secret: source == "env",
             kind: super::RowKind::Scalar,
+            orig_kind: super::ValueKind::Str,
             add_base: String::new(),
             original: original.to_string(),
         }
