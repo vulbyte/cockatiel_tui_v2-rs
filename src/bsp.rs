@@ -343,6 +343,12 @@ fn split(axis: Axis, ratio: f32, a: Box<Node>, b: Box<Node>) -> Box<Node> {
 
 /// Build a window for a view type. The existing six window impls are reused.
 pub fn make_window(view: ViewType) -> Box<dyn Window> {
+    // A LOADED view module takes precedence: the module owns the view's core and
+    // mints a fresh surface per pane (the TUI loads views the way the engine
+    // loads modules). Views not yet migrated to modules build directly below.
+    if let Some(m) = crate::cores::registry().module(view.window_id().name()) {
+        return m.make_surface();
+    }
     use crate::windows::{
         ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, StreamManagerWindow,
         UserManagementWindow, UsersWindow,

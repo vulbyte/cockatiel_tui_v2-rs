@@ -1,6 +1,7 @@
 mod app;
 mod bsp;
 mod colors;
+mod cores;
 mod db;
 mod fuzzy;
 mod rank_chart;

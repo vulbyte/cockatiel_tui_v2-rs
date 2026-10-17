@@ -25,38 +25,26 @@ pub fn supervisor_log_global(message: String) {
     }
 }
 
-/// Global MAIN log buffer shared by every `LogWindow`. Mounting two log panes
-/// must show the same lines, so the entries live here rather than inside one
-/// window: a window keeps only its own `filter` + `scroll` and reads this.
-pub static LOG_LINES: OnceLock<Arc<Mutex<VecDeque<crate::windows::log::LogEntry>>>> =
-    OnceLock::new();
+// The log DATA lives in the process-wide `LogCore` (`crate::cores::log`), which
+// owns the lines and the drawing. These are just the producer / snapshot entry
+// points (the main loop and the pop-out sync); every log pane hooks into the
+// same core, so they all show the same lines.
+pub use crate::cores::log::log_core;
 
-/// Append an entry to the shared main log buffer (capped, like the supervisor
-/// queue). Called directly by the main loop so lines are never lost when no
-/// log pane happens to be mounted.
+/// Append a line to the shared log core.
 pub fn push_log_global(entry: crate::windows::log::LogEntry) {
-    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
-    let mut q = q.lock().unwrap();
-    q.push_back(entry);
-    while q.len() > 500 {
-        q.pop_front();
-    }
+    log_core().push(entry);
 }
 
-/// A snapshot of the shared main log buffer, oldest first.
+/// A snapshot of the shared log core, oldest first.
 pub fn log_snapshot() -> Vec<crate::windows::log::LogEntry> {
-    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
-    q.lock().unwrap().iter().cloned().collect()
+    log_core().snapshot()
 }
 
-/// Replace the shared main log buffer wholesale. Used by a DETACHED window when
-/// it receives the parent TUI's snapshot, so its log panes show the parent's
-/// lines (not just its own).
+/// Replace the shared log core's lines (a detached window adopting the parent's
+/// snapshot).
 pub fn set_log_global(entries: Vec<crate::windows::log::LogEntry>) {
-    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
-    let mut q = q.lock().unwrap();
-    q.clear();
-    q.extend(entries);
+    log_core().set(entries);
 }
 
 /// The parent TUI's shared render snapshot, mirrored to detached pop-out
@@ -101,8 +89,7 @@ pub fn apply_module_status(
 /// state. The buffer is process-global and shared by parallel tests.
 #[cfg(test)]
 pub fn clear_log_global() {
-    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
-    q.lock().unwrap().clear();
+    log_core().set(Vec::new());
 }
 
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -1096,6 +1083,7 @@ mod screen_shape_tests {
     fn a_quiet_frame_keeps_the_same_shape() {
         // Content changes (logs arriving, a message moving) must NOT change the
         // shape, or every frame would trigger a needless full repaint.
+        let _g = crate::cores::log::LOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = state_with_windows();
         let before = shape(&s);
         for i in 0..50 {
@@ -1422,9 +1410,9 @@ mod same_view_panes_tests {
     /// while each keeps its own filter/scroll.
     #[test]
     fn one_global_push_is_rendered_by_both_log_panes() {
-        // The buffer is process-global; start from a known state. A tall pane
-        // keeps every buffered entry (cap 500) visible regardless of what other
-        // parallel tests append.
+        // The buffer is process-global; serialize with the other log-core tests
+        // so a parallel push flood cannot evict our line (cap 500).
+        let _g = crate::cores::log::LOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::app::clear_log_global();
         let message = "shared-buffer-line-7f3a";
         crate::app::push_log_global(LogEntry {
@@ -1506,6 +1494,9 @@ mod shared_snapshot_tests {
     /// line still appends.
     #[test]
     fn set_log_global_replaces_the_buffer() {
+        let _g = crate::cores::log::LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_log_global(vec![entry("x", "1")]);
         assert_eq!(log_snapshot().len(), 1);
         push_log_global(entry("y", "2"));

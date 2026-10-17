@@ -1,11 +1,9 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Modifier};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::app::{Window};
 use crate::colors::ColorConfig;
+use crate::cores::log::{log_core, LogView};
 use crate::db::GlobalStats;
 use crate::hotkeys::Action;
 
@@ -42,7 +40,7 @@ impl LogFilter {
         &[LogFilter::All, LogFilter::Logs, LogFilter::Errors, LogFilter::System, LogFilter::Messages]
     }
 
-    fn matches(&self, entry: &LogEntry) -> bool {
+    pub(crate) fn matches(&self, entry: &LogEntry) -> bool {
         match self {
             LogFilter::All => true,
             LogFilter::Logs => entry.event_type == 1,
@@ -53,149 +51,55 @@ impl LogFilter {
     }
 }
 
+/// The log view: a THIN surface over the shared [`crate::cores::log::LogCore`].
+/// It holds only its own filter/scroll ([`LogView`]); the data and the drawing
+/// live in the core, so every log pane (and every pop-out) shows the same lines
+/// with its own cursor.
 pub struct LogWindow {
-    pub filter: LogFilter,
-    pub scroll: usize,
+    view: LogView,
 }
 
 impl LogWindow {
     pub fn new() -> Self {
         Self {
-            filter: LogFilter::All,
-            scroll: 0,
+            view: LogView::default(),
         }
-    }
-
-    /// The shared global buffer, filtered by this window's own filter. Entries
-    /// are cloned out (the buffer is global; a window holds no copy).
-    fn filtered_entries(&self) -> Vec<LogEntry> {
-        crate::app::log_snapshot()
-            .into_iter()
-            .filter(|e| self.filter.matches(e))
-            .collect()
-    }
-
-    fn tab_bar(&self) -> Line<'_> {
-        let mut spans = vec![Span::styled("  ", Style::default())];
-        for f in LogFilter::all().iter() {
-            let is_active = *f == self.filter;
-            let style = if is_active {
-                Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            spans.push(Span::styled(format!("[{}] ", f.label()), style));
-        }
-        Line::from(spans)
     }
 }
 
 impl Window for LogWindow {
-
     fn push_log(&mut self, entry: LogEntry) {
-        crate::app::push_log_global(entry);
+        // Kept as the window-facing entry point (tests use it); the data lives in
+        // the core.
+        log_core().push(entry);
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, _stats: &GlobalStats, colors: &ColorConfig, _hotkeys: &crate::hotkeys::HotkeyConfig, _prompts: &[crate::app::PendingPrompt]) {
-        let border_color = if is_active {
-            colors.active_border_color("log")
-        } else {
-            colors.border_color("inactive")
-        };
-
-        let block = Block::default()
-            .title(" log ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
-
-        let inner = area.inner(ratatui::layout::Margin { horizontal: 1, vertical: 1 });
-
-        // Hotkey bar: wrapped to this window's width, so hints are no longer
-        // clipped off the right edge. The two-tone `key:label` styling is kept by
-        // passing the runs as separate chunks.
-        let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-        let desc_style = Style::default().fg(Color::DarkGray);
-        let hotkey = crate::windows::hotkey_wrap::layout(
-            &[
-                ("1-5".to_string(), key_style),
-                (":filter".to_string(), desc_style),
-                ("j/k".to_string(), key_style),
-                (":scroll".to_string(), desc_style),
-                ("w".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ],
-            area,
-            inner,
-        );
-        let inner = hotkey.content;
-
-        // Tab bar
-        let tab_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
-        let tab_para = Paragraph::new(self.tab_bar());
-        tab_para.render(tab_area, buf);
-
-        // Log entries
-        let log_area = Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: inner.height.saturating_sub(1) };
-
-        let filtered = self.filtered_entries();
-        let mut lines: Vec<Line> = Vec::new();
-
-        // Render from the end, honoring scroll offset (scroll=0 = newest at bottom).
-        let visible = log_area.height as usize;
-        let total = filtered.len();
-        let scroll = self.scroll.min(total.saturating_sub(1));
-
-        let start = total.saturating_sub(scroll + visible);
-        for entry in filtered.iter().skip(start).take(visible) {
-            let type_color = match entry.event_type {
-                1 => Color::DarkGray,
-                2 => Color::Yellow,
-                3 => Color::Red,
-                4 => Color::Cyan,
-                5 => Color::Green,
-                _ => Color::DarkGray,
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(format!("[{}] ", entry.source), Style::default().fg(type_color)),
-                Span::styled(&entry.message, Style::default().fg(Color::Gray)),
-            ]));
-        }
-
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled("  (no entries)", Style::default().fg(Color::DarkGray))));
-        }
-
-        let log_para = Paragraph::new(lines);
-        log_para.render(log_area, buf);
-
-        // Render border on top
-        block.render(area, buf);
-
-        // Hotkey bar (already wrapped above).
-        Paragraph::new(hotkey.lines).render(hotkey.area, buf);
+        // Delegate the presentation logic to the core.
+        log_core().render(area, buf, self.view, is_active, colors);
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent, _stats: &mut GlobalStats) -> Option<Action> {
         match key.code {
-            crossterm::event::KeyCode::Char('1') => { self.filter = LogFilter::All; Some(Action::Noop) }
-            crossterm::event::KeyCode::Char('2') => { self.filter = LogFilter::Logs; Some(Action::Noop) }
-            crossterm::event::KeyCode::Char('3') => { self.filter = LogFilter::Errors; Some(Action::Noop) }
-            crossterm::event::KeyCode::Char('4') => { self.filter = LogFilter::System; Some(Action::Noop) }
-            crossterm::event::KeyCode::Char('5') => { self.filter = LogFilter::Messages; Some(Action::Noop) }
+            crossterm::event::KeyCode::Char('1') => { self.view.filter = LogFilter::All; Some(Action::Noop) }
+            crossterm::event::KeyCode::Char('2') => { self.view.filter = LogFilter::Logs; Some(Action::Noop) }
+            crossterm::event::KeyCode::Char('3') => { self.view.filter = LogFilter::Errors; Some(Action::Noop) }
+            crossterm::event::KeyCode::Char('4') => { self.view.filter = LogFilter::System; Some(Action::Noop) }
+            crossterm::event::KeyCode::Char('5') => { self.view.filter = LogFilter::Messages; Some(Action::Noop) }
             crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
-                self.scroll = self.scroll.saturating_add(1);
+                self.view.scroll = self.view.scroll.saturating_add(1);
                 Some(Action::Noop)
             }
             crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
-                self.scroll = self.scroll.saturating_sub(1);
+                self.view.scroll = self.view.scroll.saturating_sub(1);
                 Some(Action::Noop)
             }
             crossterm::event::KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.view.scroll = self.view.scroll.saturating_add(10);
                 Some(Action::Noop)
             }
             crossterm::event::KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.view.scroll = self.view.scroll.saturating_sub(10);
                 Some(Action::Noop)
             }
             crossterm::event::KeyCode::Char('w') => Some(Action::PopOut("log".to_string())),
@@ -269,6 +173,7 @@ mod log_bounds_tests {
     /// a shape change fixes.
     #[test]
     fn log_never_paints_outside_its_own_area() {
+        let _g = crate::cores::log::LOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (w, h) in [(120u16, 40u16), (200, 60), (80, 24), (60, 20)] {
             for pct in [10u16, 30, 50, 90] {
                 probe(w, h, pct);
@@ -276,4 +181,3 @@ mod log_bounds_tests {
         }
     }
 }
-
