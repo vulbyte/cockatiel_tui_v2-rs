@@ -182,14 +182,23 @@ impl WsClient {
 
     async fn connect_and_run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // WSS when the supervisor set COCKATIEL_TLS_CERT (engine only accepts WSS).
-        let (scheme, connector): (&str, Option<tokio_tungstenite::Connector>) =
+        //
+        // A DETACHED child is the exception: it talks to its PARENT TUI, whose WS
+        // server is PLAIN (`accept_async`), not to the engine. It inherits
+        // COCKATIEL_TLS_CERT from the parent's own env (set for the engine link),
+        // so it must IGNORE it — otherwise it speaks TLS at a plain server and
+        // never connects (httparse: invalid token), which left every pop-out dead.
+        let (scheme, connector): (&str, Option<tokio_tungstenite::Connector>) = if self.parent_mode {
+            ("ws", None)
+        } else {
             match std::env::var("COCKATIEL_TLS_CERT") {
                 Ok(path) if !path.trim().is_empty() => {
                     let cfg = pinned_tls_config(&path)?;
                     ("wss", Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg))))
                 }
                 _ => ("ws", None),
-            };
+            }
+        };
         let url = format!("{}://{}:{}", scheme, self.ip, self.port);
 
         let result = match &connector {
