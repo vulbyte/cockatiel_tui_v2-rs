@@ -9,7 +9,7 @@ use crate::colors::ColorConfig;
 use crate::db::GlobalStats;
 use crate::hotkeys::Action;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     #[allow(dead_code)]
     pub timestamp: String,

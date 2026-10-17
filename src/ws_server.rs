@@ -144,19 +144,89 @@ async fn handle_child(
     let (mut sink, mut stream) = ws_stream.split();
     let child_uuid = my_uuid.clone();
 
+    // Seed the child with the CURRENT shared snapshot so it mirrors this TUI
+    // immediately (logs, module statuses, connection) before any delta arrives.
+    {
+        let snap = crate::app::shared_snapshot().lock().unwrap().clone();
+        if let Ok(payload) = serde_json::to_vec(&snap) {
+            let msg = ContainerForModule {
+                version: 2,
+                auth_token: my_uuid.clone(),
+                module_instance_uuid7: my_uuid.clone(),
+                payload: Some(ModulePayload::TuiSync(TuiSync {
+                    kind: "snapshot".into(),
+                    payload,
+                })),
+            };
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    msg.encode_to_vec().into(),
+                ))
+                .await;
+        }
+    }
+
     // Forward broadcast events to child
     let forward_task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(WsEvent::Log { source, message, event_type: _ }) => {
+                Ok(WsEvent::Log { source, message, event_type }) => {
+                    let entry = crate::windows::log::LogEntry {
+                        timestamp: String::new(),
+                        source,
+                        message,
+                        event_type,
+                    };
+                    let Ok(payload) = serde_json::to_vec(&entry) else { continue };
                     let msg = ContainerForModule {
                         version: 2,
                         auth_token: my_uuid.clone(),
                         module_instance_uuid7: my_uuid.clone(),
-                        payload: Some(ModulePayload::Log(Log {
-                            log: format!("[{}] {}", source, message),
-                            blob: Vec::new(),
+                        payload: Some(ModulePayload::TuiSync(TuiSync {
+                            kind: "log".into(),
+                            payload,
                         })),
+                    };
+                    if sink
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            msg.encode_to_vec().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // The shared snapshot: the child replaces its logs / module
+                // statuses / connection with the parent's.
+                Ok(WsEvent::Snapshot(json)) => {
+                    let msg = ContainerForModule {
+                        version: 2,
+                        auth_token: my_uuid.clone(),
+                        module_instance_uuid7: my_uuid.clone(),
+                        payload: Some(ModulePayload::TuiSync(TuiSync {
+                            kind: "snapshot".into(),
+                            payload: json.into_bytes(),
+                        })),
+                    };
+                    if sink
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            msg.encode_to_vec().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // A prompt for the user: relayed proto-native so the child's
+                // prompts window can answer it.
+                Ok(WsEvent::Prompt(prompt)) => {
+                    let msg = ContainerForModule {
+                        version: 2,
+                        auth_token: my_uuid.clone(),
+                        module_instance_uuid7: my_uuid.clone(),
+                        payload: Some(ModulePayload::Prompt(prompt)),
                     };
                     if sink
                         .send(tokio_tungstenite::tungstenite::Message::Binary(

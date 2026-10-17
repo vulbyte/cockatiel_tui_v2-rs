@@ -717,6 +717,8 @@ async fn run_app(
     // Fingerprint of the last drawn frame's shape; a change forces a full
     // repaint instead of a diff. `None` until the first frame is drawn.
     let mut last_shape: Option<crate::app::ScreenShape> = None;
+    // Throttle for the detached-window shared-snapshot broadcast.
+    let mut last_snapshot_push = Instant::now();
 
     // External SIGTERM/SIGINT (e.g. `kill`): quit through the normal path so
     // main() runs the full supervisor + terminal teardown (graceful group
@@ -1110,6 +1112,31 @@ async fn run_app(
             }
         }
 
+        // Publish + forward the shared snapshot for detached pop-out windows so
+        // they mirror this TUI's logs + module statuses. Only when a pop-out
+        // exists (zero cost otherwise); throttled so a log flood cannot turn
+        // every frame into a full-state serialization.
+        if !state.popped_out.is_empty()
+            && last_snapshot_push.elapsed() >= Duration::from_millis(400)
+        {
+            last_snapshot_push = Instant::now();
+            let snap = crate::app::SharedSnapshot {
+                logs: crate::app::log_snapshot(),
+                module_status: state
+                    .stats
+                    .module_entries
+                    .iter()
+                    .map(|e| (e.name.clone(), e.status.clone()))
+                    .collect(),
+                connected: state.connected,
+                engine_status: state.stats.engine_status.clone(),
+            };
+            *crate::app::shared_snapshot().lock().unwrap() = snap.clone();
+            if let Ok(json) = serde_json::to_string(&snap) {
+                let _ = ws_broadcast_tx.send(WsEvent::Snapshot(json));
+            }
+        }
+
         // A window that moved or resized can leave stale cells behind, because
         // ratatui only repaints what differs from the previous frame. When the
         // screen's SHAPE changes -- a layout drag, entering/leaving the config
@@ -1252,6 +1279,25 @@ fn handle_ws_event(
                 message,
                 event_type,
             });
+        }
+        // A DETACHED window mirroring its parent: replace our log buffer with the
+        // parent's, overlay its module statuses and adopt its connection state.
+        WsEvent::Snapshot(json) => {
+            match serde_json::from_str::<crate::app::SharedSnapshot>(&json) {
+                Ok(snap) => {
+                    crate::app::set_log_global(snap.logs);
+                    crate::app::apply_module_status(
+                        &mut state.stats.module_entries,
+                        &snap.module_status,
+                    );
+                    state.connected = snap.connected;
+                    state.stats.engine_status = snap.engine_status;
+                }
+                Err(e) => crate::app::supervisor_log_global(format!(
+                    "[ws] bad snapshot from parent: {}",
+                    e
+                )),
+            }
         }
         WsEvent::StatsUpdate(mut stats) => {
             stats.engine_status = state.stats.engine_status.clone();

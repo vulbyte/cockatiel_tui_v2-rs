@@ -22,6 +22,10 @@ pub enum WsEvent {
     StatsUpdate(db::GlobalStats),
     ConnectionInfo { ip: String, port: u16, pin: u32 },
     Prompt(Prompt),
+    /// A parent TUI's shared snapshot (DETACHED windows only), JSON-encoded
+    /// [`crate::app::SharedSnapshot`]. Applied wholesale so the child mirrors the
+    /// parent's logs, module statuses and connection state.
+    Snapshot(String),
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +346,32 @@ impl WsClient {
                                             message: log.log,
                                             event_type: 1,
                                         });
+                                    }
+                                    // TUI-internal: the parent's shared snapshot
+                                    // / live log lines, so this detached window
+                                    // mirrors the parent.
+                                    Some(ModulePayload::TuiSync(sync)) => match sync.kind.as_str() {
+                                        "snapshot" => {
+                                            let json =
+                                                String::from_utf8_lossy(&sync.payload).into_owned();
+                                            let _ = self.event_tx.send(WsEvent::Snapshot(json));
+                                        }
+                                        "log" => {
+                                            if let Ok(entry) = serde_json::from_slice::<
+                                                crate::windows::log::LogEntry,
+                                            >(&sync.payload)
+                                            {
+                                                let _ = self.event_tx.send(WsEvent::Log {
+                                                    source: entry.source,
+                                                    message: entry.message,
+                                                    event_type: entry.event_type,
+                                                });
+                                            }
+                                        }
+                                        _ => {}
+                                    },
+                                    Some(ModulePayload::Prompt(prompt)) => {
+                                        let _ = self.event_tx.send(WsEvent::Prompt(prompt));
                                     }
                                     Some(ModulePayload::DatabaseQueryResult(result)) => {
                                         let query_id = result.query_id.clone();

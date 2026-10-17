@@ -49,6 +49,54 @@ pub fn log_snapshot() -> Vec<crate::windows::log::LogEntry> {
     q.lock().unwrap().iter().cloned().collect()
 }
 
+/// Replace the shared main log buffer wholesale. Used by a DETACHED window when
+/// it receives the parent TUI's snapshot, so its log panes show the parent's
+/// lines (not just its own).
+pub fn set_log_global(entries: Vec<crate::windows::log::LogEntry>) {
+    let q = LOG_LINES.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())));
+    let mut q = q.lock().unwrap();
+    q.clear();
+    q.extend(entries);
+}
+
+/// The parent TUI's shared render snapshot, mirrored to detached pop-out
+/// windows so every window of a view type shows the same data. The main loop
+/// keeps it current; the WS server sends it to a child on connect and forwards
+/// it on change. `module_status` is the FINAL displayed status per module (the
+/// draw-loop supervisor overlays already applied), so a child can render the
+/// engine's module list with the same statuses.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SharedSnapshot {
+    pub logs: Vec<crate::windows::log::LogEntry>,
+    pub module_status: Vec<(String, String)>,
+    pub connected: bool,
+    pub engine_status: String,
+}
+
+/// The process-wide shared snapshot (one per process: the parent writes it, the
+/// WS server reads it to seed a child).
+pub static SHARED_SNAPSHOT: OnceLock<Arc<Mutex<SharedSnapshot>>> = OnceLock::new();
+
+/// The shared snapshot cell, initialised on first use.
+pub fn shared_snapshot() -> Arc<Mutex<SharedSnapshot>> {
+    SHARED_SNAPSHOT
+        .get_or_init(|| Arc::new(Mutex::new(SharedSnapshot::default())))
+        .clone()
+}
+
+/// Overlay a snapshot's per-module statuses onto `entries` (by name). Used by a
+/// detached window to reproduce the parent's supervisor-status overlay.
+pub fn apply_module_status(
+    entries: &mut [crate::db::ModuleStatus],
+    status: &[(String, String)],
+) {
+    for (name, st) in status {
+        if let Some(e) = entries.iter_mut().find(|e| &e.name == name) {
+            e.status = st.clone();
+        }
+    }
+}
+
 /// Test-only: empty the shared main log buffer so a test starts from a known
 /// state. The buffer is process-global and shared by parallel tests.
 #[cfg(test)]
@@ -1397,5 +1445,90 @@ mod same_view_panes_tests {
             2,
             "each of the two panes must render the shared line:\n{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_snapshot_tests {
+    use super::*;
+    use crate::db::ModuleStatus;
+    use crate::windows::log::LogEntry;
+
+    fn entry(source: &str, message: &str) -> LogEntry {
+        LogEntry {
+            timestamp: String::new(),
+            source: source.into(),
+            message: message.into(),
+            event_type: 1,
+        }
+    }
+
+    fn module(name: &str, status: &str) -> ModuleStatus {
+        ModuleStatus {
+            name: name.into(),
+            description: String::new(),
+            status: status.into(),
+            position: String::new(),
+            credentials: Vec::new(),
+            credential_values: Default::default(),
+            config_complete: false,
+            alive: true,
+            avg_ms: None,
+            autostart: false,
+            authority: 0,
+            price: 0,
+            min_rank: 0.0,
+        }
+    }
+
+    /// The snapshot crosses the wire as JSON, so it has to survive a round trip.
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let snap = SharedSnapshot {
+            logs: vec![entry("a", "b")],
+            module_status: vec![("mod".into(), "starting".into())],
+            connected: true,
+            engine_status: "connected".into(),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SharedSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.logs.len(), 1);
+        assert_eq!(back.logs[0].source, "a");
+        assert_eq!(
+            back.module_status,
+            vec![("mod".to_string(), "starting".to_string())]
+        );
+        assert!(back.connected);
+        assert_eq!(back.engine_status, "connected");
+    }
+
+    /// A detached window REPLACES its log buffer with the parent's; a live log
+    /// line still appends.
+    #[test]
+    fn set_log_global_replaces_the_buffer() {
+        set_log_global(vec![entry("x", "1")]);
+        assert_eq!(log_snapshot().len(), 1);
+        push_log_global(entry("y", "2"));
+        assert_eq!(log_snapshot().len(), 2);
+        set_log_global(vec![entry("z", "3")]);
+        let s = log_snapshot();
+        assert_eq!(s.len(), 1, "set replaces, not appends");
+        assert_eq!(s[0].source, "z");
+    }
+
+    /// The parent's per-module statuses overlay the child's engine-reported list
+    /// by NAME, leaving other entries untouched.
+    #[test]
+    fn apply_module_status_overlays_by_name() {
+        let mut entries = vec![module("a", "connected"), module("b", "connected")];
+        apply_module_status(
+            &mut entries,
+            &[
+                ("b".to_string(), "starting".to_string()),
+                ("missing".to_string(), "crashed".to_string()),
+            ],
+        );
+        assert_eq!(entries[0].status, "connected");
+        assert_eq!(entries[1].status, "starting");
     }
 }
