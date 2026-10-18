@@ -2986,9 +2986,25 @@ fn spawn_log_reader(
 }
 
 /// Best-effort detection of an error line from a module's stderr.
+///
+/// Matches genuine error markers only. The bare substring "error" used to be a
+/// match, which falsely badged a healthy module as errored whenever a benign
+/// warning merely mentioned the word — e.g. the YouTube adapter's startup
+/// "gRPC transport unavailable (transport error); continuing with REST API",
+/// which fires on every launch even though the REST fallback works fine.
+/// Tracing errors carry an uppercase `ERROR` level token (`error!` renders as
+/// `ERROR <target>: ...`); plain-printed errors use `error:` / `error …` /
+/// `panic` / `failed to` / `rejected`.
 fn line_indicates_error(line: &str) -> bool {
+    if line.contains("ERROR") {
+        return true;
+    }
     let lower = line.to_ascii_lowercase();
-    lower.contains("error") || lower.contains("panic") || lower.contains("failed to") || lower.contains("rejected")
+    lower.contains("error:")
+        || lower.contains("failed to")
+        || lower.starts_with("error ")
+        || lower.contains("panic")
+        || lower.contains("rejected")
 }
 
 /// Spawn a background monitor for a just-launched module. It polls the child
@@ -4227,6 +4243,34 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[2K\u{1b}[1GCompiling foo\rFinished"), "Compiling fooFinished");
         // Bare ESC.
         assert_eq!(strip_ansi("a\u{1b}Kb"), "ab");
+    }
+
+    #[test]
+    fn benign_warnings_are_not_errors() {
+        // A WARN that merely contains the word "error" must not badge the
+        // module as errored (the YouTube adapter's startup line, which fires on
+        // every launch with a working REST fallback).
+        assert!(!line_indicates_error(
+            "2026-10-18T16:56:14Z  WARN youtube_adapter_rs: YouTube gRPC transport unavailable (transport error); continuing with REST API"
+        ));
+        assert!(!line_indicates_error(
+            "WARN banned_words: risk model reported 0 errors"
+        ));
+        assert!(!line_indicates_error("INFO scanning for active streams"));
+    }
+
+    #[test]
+    fn genuine_errors_are_detected() {
+        // Tracing errors carry the uppercase ERROR level token.
+        assert!(line_indicates_error(
+            "2026-10-18T09:03:04Z ERROR youtube_adapter_rs: Error polling chat: timed out"
+        ));
+        // Plain-printed markers.
+        assert!(line_indicates_error("error: could not bind port 8080"));
+        assert!(line_indicates_error("error sending request for url"));
+        assert!(line_indicates_error("thread 'main' panicked at src/main.rs:1"));
+        assert!(line_indicates_error("Failed to fetch stream abc"));
+        assert!(line_indicates_error("Rejected: user denied module 'x'"));
     }
 
     #[test]
