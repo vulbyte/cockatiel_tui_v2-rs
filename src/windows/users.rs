@@ -418,16 +418,20 @@ mod tests {
 
     #[test]
     fn rank_tier_boundaries() {
-        // The tier comes from the 0-1 rank via the root rank_chart.json
-        // (mineral ladder, one tier per 0.1).
-        assert_eq!(crate::rank_chart::tier_name(0.0), "coal");
-        assert_eq!(crate::rank_chart::tier_name(0.09), "coal");
-        assert_eq!(crate::rank_chart::tier_name(0.1), "copper");
-        assert_eq!(crate::rank_chart::tier_name(0.2), "bronze");
-        assert_eq!(crate::rank_chart::tier_name(0.45), "gold");
-        assert_eq!(crate::rank_chart::tier_name(0.5), "sapphire");
-        assert_eq!(crate::rank_chart::tier_name(0.9), "opal");
-        assert_eq!(crate::rank_chart::tier_name(1.0), "opal");
+        // The built-in mineral ladder, one tier per 0.1. Asserted on the TEMPLATE
+        // so the test does not depend on the operator's live `rank_chart.json`
+        // (which is editable and may use other names/thresholds). That the
+        // display path actually goes through the chart is covered by
+        // `rank_chart`'s own lookup test.
+        let c = crate::rank_chart::default_chart();
+        assert_eq!(c.name_for_rank(0.0), "coal");
+        assert_eq!(c.name_for_rank(0.09), "coal");
+        assert_eq!(c.name_for_rank(0.1), "copper");
+        assert_eq!(c.name_for_rank(0.2), "bronze");
+        assert_eq!(c.name_for_rank(0.45), "gold");
+        assert_eq!(c.name_for_rank(0.5), "sapphire");
+        assert_eq!(c.name_for_rank(0.9), "opal");
+        assert_eq!(c.name_for_rank(1.0), "opal");
     }
 
     #[test]

@@ -5918,16 +5918,29 @@ mod engine_row_tests {
             _ => {}
         });
         let screen = super::tests::render(&mut w, &stats, 120, 30);
+        // The tier NAME comes from the operator-editable rank chart, so derive
+        // the expected labels from it instead of hardcoding mineral names.
+        let chart = crate::rank_chart::chart();
+        let at_0_9 = chart.name_for_rank(0.9);
+        let at_0_4 = chart.name_for_rank(0.4);
+        let lowest = chart.name_for_rank(0.0);
         let line = |needle: &str| {
             screen
                 .lines()
                 .find(|l| l.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
         };
-        assert!(line("tts-service").contains(" opal"), "0.9 -> opal: {}", line("tts-service"));
-        assert!(line("language-constrainer").contains(" gold"), "0.4 -> gold");
         assert!(
-            !line("banned-words").contains("coal"),
+            line("tts-service").contains(&format!(" {at_0_9}")),
+            "0.9 -> {at_0_9}: {}",
+            line("tts-service")
+        );
+        assert!(
+            line("language-constrainer").contains(&format!(" {at_0_4}")),
+            "0.4 -> {at_0_4}"
+        );
+        assert!(
+            !line("banned-words").contains(&format!(" {lowest}")),
             "no rank gate must render blank, not the lowest tier: {}",
             line("banned-words")
         );

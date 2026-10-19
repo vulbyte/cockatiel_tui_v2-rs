@@ -765,8 +765,19 @@ mod tests {
         assert_eq!(stats.users[0].score, 60);
         assert!(stats.users[0].is_sponsor);
         assert_eq!(stats.users[0].channels.len(), 1);
-        assert_eq!(stats.users[0].rank_tier(), "opal");
-        assert_eq!(stats.users[1].rank_tier(), "coal");
+        // The tier NAME comes from the operator-editable, env-dependent rank
+        // chart, so assert the parsed rank and that `rank_tier` goes THROUGH the
+        // chart — not a fixed mineral name (which the live chart may not use).
+        assert_eq!(stats.users[0].rank, 0.93);
+        assert_eq!(stats.users[1].rank, 0.02);
+        assert_eq!(
+            stats.users[0].rank_tier(),
+            crate::rank_chart::chart().name_for_rank(0.93)
+        );
+        assert_eq!(
+            stats.users[1].rank_tier(),
+            crate::rank_chart::chart().name_for_rank(0.02)
+        );
         assert!(stats.user_last_error.is_none());
     }
 
