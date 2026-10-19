@@ -584,19 +584,39 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
     }
 }
 
-pub fn get_pending_queries() -> Vec<(&'static str, String)> {
-    // The engine's `stats` virtual query returns ALL timeline aggregates in one
-    // response (Phase 2 replaced the six raw-SQL stats queries that used to be
-    // fired here every poll). db_status / module_list / userdb remain separate
-    // named ops.
+/// Queries polled every tick regardless of which windows are open: the engine's
+/// `stats` aggregates (one virtual query replacing the six raw-SQL stats queries
+/// Phase 2 removed) plus the module list and DB/pipeline status the header shows.
+pub fn core_queries() -> Vec<(&'static str, String)> {
     vec![
         ("stats", "{}".to_string()),
-        ("module_list", "SELECT 1".to_string()),  // virtual query, engine returns module list
-        ("db_status", "SELECT 1".to_string()),  // virtual query: timeline/userdb backup status + pipeline_paused
-        ("userdb_list_users", r#"{"limit":500}"#.to_string()),  // virtual query: user DB list (score DESC)
-        ("stream_leaderboard", "{}".to_string()),  // virtual query: current-stream ranking (cached report)
-        ("stream_schedule", "{}".to_string()),  // virtual query: desired stream control + adapter statuses
+        ("module_list", "SELECT 1".to_string()), // virtual query, engine returns module list
+        ("db_status", "SELECT 1".to_string()),   // virtual: timeline/userdb backup status + pipeline_paused
     ]
+}
+
+/// Queries polled ONLY while their owning window is open. Each maps to exactly
+/// the window that renders its result: `stream_leaderboard` → the top-users
+/// view, `userdb_list_users` → user management, `stream_schedule` → the stream
+/// manager. These are the heavier per-window reads; not firing them while their
+/// window is closed is the whole point — it lets the poll load scale with what
+/// is on screen instead of running unconditionally every tick.
+pub fn extended_queries(
+    show_top_users: bool,
+    show_user_admin: bool,
+    show_stream: bool,
+) -> Vec<(&'static str, String)> {
+    let mut q = Vec::new();
+    if show_top_users {
+        q.push(("stream_leaderboard", "{}".to_string())); // virtual: current-stream ranking (cached report)
+    }
+    if show_user_admin {
+        q.push(("userdb_list_users", r#"{"limit":500}"#.to_string())); // virtual: user DB list (score DESC)
+    }
+    if show_stream {
+        q.push(("stream_schedule", "{}".to_string())); // virtual: desired stream control + adapter statuses
+    }
+    q
 }
 
 /// A one-line, honest summary of a `pipeline_set_paused` response for the log
@@ -842,11 +862,36 @@ mod tests {
     }
 
     #[test]
-    fn pending_queries_include_userdb_list() {
-        let qs = get_pending_queries();
-        let userdb = qs.iter().find(|(id, _)| *id == "userdb_list_users").expect("userdb poll");
+    fn each_extended_query_is_gated_on_its_own_window() {
+        let has = |qs: &[(&'static str, String)], id: &str| qs.iter().any(|(i, _)| *i == id);
+
+        // (show_top_users, show_user_admin, show_stream)
+        assert!(extended_queries(false, false, false).is_empty());
+
+        // Top-users window → the cached leaderboard.
+        let users = extended_queries(true, false, false);
+        assert!(has(&users, "stream_leaderboard"));
+        assert!(!has(&users, "userdb_list_users"));
+
+        // User-management window → the user list, with the expected payload.
+        let admin = extended_queries(false, true, false);
+        let userdb = admin
+            .iter()
+            .find(|(id, _)| *id == "userdb_list_users")
+            .expect("user-management polls the user list");
         let payload: serde_json::Value = serde_json::from_str(&userdb.1).unwrap();
         assert_eq!(payload["limit"], 500);
+
+        // Stream-manager window → the schedule/control status.
+        assert!(has(&extended_queries(false, false, true), "stream_schedule"));
+
+        // The always-on core set must never include a heavy per-window read.
+        assert!(core_queries().iter().all(|(id, _)| ![
+            "userdb_list_users",
+            "stream_leaderboard",
+            "stream_schedule"
+        ]
+        .contains(id)));
     }
 
     fn db_status_result(blob: &str) -> DatabaseQueryResult {

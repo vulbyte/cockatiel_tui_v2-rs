@@ -31,6 +31,10 @@ pub enum WsEvent {
 #[derive(Debug, Clone)]
 pub enum WsCommand {
     SendQuery { query_id: String, sql: String },
+    /// Replace the set of queries fired on each poll tick. The UI sends this
+    /// when the set of OPEN windows changes, so heavy per-window queries only
+    /// run while their window is visible.
+    SetPollSet(Vec<(String, String)>),
     SendPromptResponse { prompt_id: String, accepted: bool, reason: String },
     SendLog { source: String, message: String },
     /// Close the engine socket NOW and never reconnect. Sent when the TUI
@@ -50,6 +54,10 @@ pub struct WsClient {
     pub event_tx: mpsc::UnboundedSender<WsEvent>,
     pub command_rx: mpsc::UnboundedReceiver<WsCommand>,
     pub stats: db::GlobalStats,
+    /// Queries fired each poll tick. Replaced by [`WsCommand::SetPollSet`] when
+    /// the set of OPEN windows changes; starts as the always-on core set so the
+    /// header/dashboard populate before the UI sends its first poll set.
+    pub poll_set: Vec<(String, String)>,
     pub parent_mode: bool,
     /// Set by the TUI when the engine has been deliberately removed. Read
     /// between connection attempts, so a detached client stops for good instead
@@ -94,6 +102,7 @@ impl WsClient {
             event_tx,
             command_rx,
             stats: db::GlobalStats::default(),
+            poll_set: db::core_queries().into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             parent_mode: false,
             stopped: Arc::new(AtomicBool::new(false)),
         }
@@ -113,6 +122,7 @@ impl WsClient {
             event_tx,
             command_rx,
             stats: db::GlobalStats::default(),
+            poll_set: db::core_queries().into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             parent_mode: true,
             stopped: Arc::new(AtomicBool::new(false)),
         }
@@ -571,6 +581,12 @@ impl WsClient {
                                     let _ = write.send(WsMessage::Binary(buf.into())).await;
                                 }
                             }
+                            WsCommand::SetPollSet(set) => {
+                                // The UI recomputes this when the open-window set
+                                // changes; take it as-is (empty is legal — core
+                                // queries are always included by the caller).
+                                self.poll_set = set;
+                            }
                             WsCommand::SendPromptResponse { prompt_id, accepted, reason } => {
                                 let container = ContainerForEngine {
                                     version: 2,
@@ -616,7 +632,7 @@ impl WsClient {
                             initial_tick = false;
                             continue;
                         }
-                        for (query_id, sql) in db::get_pending_queries() {
+                        for (query_id, sql) in self.poll_set.clone() {
                             let container = ContainerForEngine {
                                 version: 2,
                                 auth_token: auth_token.clone(),

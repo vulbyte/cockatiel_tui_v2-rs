@@ -679,6 +679,44 @@ fn handle_user_db_provision(
     }
 }
 
+/// The queries the engine client should poll, given the windows currently open
+/// (embedded leaves plus detached pop-outs). Core queries always run; the heavy
+/// per-window queries (`userdb_list_users`, `stream_leaderboard`,
+/// `stream_schedule`) run only while their window is on screen, so idle windows
+/// cost nothing.
+fn poll_set_for(state: &AppState) -> Vec<(String, String)> {
+    use crate::bsp::ViewType;
+    let mut show_top_users = false;
+    let mut show_user_admin = false;
+    let mut show_stream = false;
+    for (_name, view, _rect, _focused) in state.tree.leaves() {
+        match view {
+            ViewType::TopUsers => show_top_users = true,
+            ViewType::UserManagement => show_user_admin = true,
+            ViewType::StreamManager => show_stream = true,
+            _ => {}
+        }
+    }
+    // A detached pop-out is a second surface of the same view, so it counts as
+    // open too.
+    for id in &state.popped_out {
+        match id.as_str() {
+            "users" => show_top_users = true,
+            "user_management" => show_user_admin = true,
+            "stream_manager" => show_stream = true,
+            _ => {}
+        }
+    }
+    let mut set: Vec<(String, String)> = crate::db::core_queries()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    for (k, v) in crate::db::extended_queries(show_top_users, show_user_admin, show_stream) {
+        set.push((k.to_string(), v));
+    }
+    set
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -758,6 +796,9 @@ async fn run_app(
     // liveness blip can't kill a healthy module.
     let mut watchdog_suspects: std::collections::HashMap<String, ()> =
         std::collections::HashMap::new();
+    // Last poll set pushed to the engine client; the tick arm recomputes it
+    // from the open windows and sends an update only when it changes.
+    let mut last_poll_set: Vec<(String, String)> = Vec::new();
 
     loop {
         tokio::select! {
@@ -910,6 +951,14 @@ async fn run_app(
                 // watchdog is skipping disconnected frames.
                 state.stats.pause_flash_tick = pause_flash_tick;
                 pause_flash_tick = pause_flash_tick.wrapping_add(1);
+                // Keep the engine poll set in step with the open views: the
+                // heavy per-window queries only run while their window is on
+                // screen. Sent only on change (cheap; the tick is 100ms).
+                let desired_poll_set = poll_set_for(state);
+                if desired_poll_set != last_poll_set {
+                    last_poll_set = desired_poll_set.clone();
+                    let _ = ws_command_tx.send(WsCommand::SetPollSet(desired_poll_set));
+                }
                 // A shutdown request the engine never answered must not leave
                 // the removal half-done (asked, never resolved, and the engine
                 // still there). A broken socket usually shows up as a
