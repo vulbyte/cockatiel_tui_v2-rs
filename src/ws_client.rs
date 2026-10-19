@@ -314,6 +314,23 @@ impl WsClient {
         self.auth_token = auth_token;
         self.instance_uuid7 = assigned_uuid;
 
+        // Move the write half into its OWN task. The read loop below must never
+        // block on a socket write: if it does, it stops reading, the engine's
+        // outbound queue fills, the engine's own write to us times out, and it
+        // drops the connection — a mutual-block "flap" that showed up as
+        // repeated "Connection to 'cockatiel-tui' dropped: outbound send failed"
+        // plus a full outbound channel. Decoupling the writer keeps the reader
+        // always draining; a briefly-blocked write is contained to this task and
+        // clears as soon as the engine reads our frames.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+        let writer = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let _ = self.event_tx.send(WsEvent::Connected);
         let _ = self.event_tx.send(WsEvent::ConnectionInfo {
             ip: self.ip.clone(),
@@ -341,7 +358,7 @@ impl WsClient {
             };
             let mut auth_buf = Vec::new();
             if auth_cont.encode(&mut auth_buf).is_ok() {
-                let _ = write.send(WsMessage::Binary(auth_buf)).await;
+                let _ = out_tx.send(WsMessage::Binary(auth_buf));
             }
 
             let auth_token = self.auth_token.clone();
@@ -425,7 +442,7 @@ impl WsClient {
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
-                                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                    let _ = out_tx.send(WsMessage::Binary(buf.into()));
                                 }
                             }
                             // Only the TUI removes the engine, and the TUI is
@@ -539,7 +556,7 @@ impl WsClient {
                                         };
                                         let mut rb = Vec::new();
                                         if reply.encode(&mut rb).is_ok() {
-                                            let _ = write.send(WsMessage::Binary(rb.into())).await;
+                                            let _ = out_tx.send(WsMessage::Binary(rb.into()));
                                         }
                                     }
                                     _ => {}
@@ -578,7 +595,7 @@ impl WsClient {
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
-                                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                    let _ = out_tx.send(WsMessage::Binary(buf.into()));
                                 }
                             }
                             WsCommand::SetPollSet(set) => {
@@ -601,7 +618,7 @@ impl WsClient {
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
-                                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                    let _ = out_tx.send(WsMessage::Binary(buf.into()));
                                 }
                             }
                             WsCommand::SendLog { source, message } => {
@@ -617,7 +634,7 @@ impl WsClient {
                                 };
                                 let mut buf = Vec::new();
                                 if container.encode(&mut buf).is_ok() {
-                                    let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                    let _ = out_tx.send(WsMessage::Binary(buf.into()));
                                 }
                             }
                             // The engine was removed from the TUI: close the
@@ -646,7 +663,7 @@ impl WsClient {
                             };
                             let mut buf = Vec::new();
                             if container.encode(&mut buf).is_ok() {
-                                let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                let _ = out_tx.send(WsMessage::Binary(buf.into()));
                             }
                         }
                     }
@@ -655,6 +672,10 @@ impl WsClient {
         }
 
         let _ = self.event_tx.send(WsEvent::Disconnected);
+        // Close the writer task: dropping the sender ends its recv loop. Best
+        // effort — a socket already gone makes the join return immediately.
+        drop(out_tx);
+        let _ = writer.await;
         Ok(())
     }
 }
