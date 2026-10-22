@@ -141,6 +141,13 @@ pub struct GlobalStats {
     /// actions would still be advertised.
     pub engine_removed: bool,
     pub module_entries: Vec<ModuleStatus>,
+    /// How many modules the engine expects (union of its config ordering
+    /// lists), how many of those have a live session, and whether every
+    /// expected module is up. Carried on each `module_list` row; the poll that
+    /// already refreshes `module_entries` keeps these current.
+    pub modules_configured: u32,
+    pub modules_live: u32,
+    pub modules_ready: bool,
     pub connection: ConnectionInfo,
     /// Whether a backup DB is configured for the timeline and the user DB.
     pub timeline_backup: bool,
@@ -220,6 +227,9 @@ impl Default for GlobalStats {
             engine_status: "disconnected".to_string(),
             engine_removed: false,
             module_entries: Vec::new(),
+            modules_configured: 0,
+            modules_live: 0,
+            modules_ready: true,
             connection: ConnectionInfo::default(),
             timeline_backup: false,
             userdb_backup: false,
@@ -524,6 +534,25 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
     if let Some(rows) = parse_query_result(result) {
         if query_id == "module_list" {
                 stats.module_entries.clear();
+                // The aggregate is repeated on every row (the engine keeps
+                // `module_list` an array for its other consumers); an empty
+                // list means nothing is configured, which is ready by
+                // definition.
+                let summary = rows.first();
+                stats.modules_configured = summary
+                    .and_then(|r| r.get("modules_configured"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0);
+                stats.modules_live = summary
+                    .and_then(|r| r.get("modules_live"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0);
+                stats.modules_ready = summary
+                    .and_then(|r| r.get("modules_ready"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(stats.modules_live >= stats.modules_configured);
                 for row in &rows {
                     if let Some(name) = row.get("name").and_then(|v| v.as_str()) {
                         let description = row.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -903,6 +932,69 @@ mod tests {
             "stream_schedule"
         ]
         .contains(id)));
+    }
+
+    #[test]
+    fn module_list_carries_the_aggregate_module_load_state() {
+        let mut stats = GlobalStats::default();
+        let envelope = serde_json::json!([
+            {
+                "name": "twitch",
+                "connected_at": 1,
+                "modules_configured": 3,
+                "modules_live": 1,
+                "modules_ready": false
+            },
+            {
+                "name": "clip",
+                "connected_at": null,
+                "modules_configured": 3,
+                "modules_live": 1,
+                "modules_ready": false
+            }
+        ]);
+        update_stats_from_query(
+            &mut stats,
+            "module_list",
+            &userdb_result("module_list", true, "", &envelope),
+        );
+        assert_eq!(stats.modules_configured, 3);
+        assert_eq!(stats.modules_live, 1);
+        assert!(!stats.modules_ready);
+
+        // Every expected module is live now: the next poll must clear the
+        // loading state, not latch it.
+        let envelope = serde_json::json!([{
+            "name": "twitch",
+            "modules_configured": 3,
+            "modules_live": 3,
+            "modules_ready": true
+        }]);
+        update_stats_from_query(
+            &mut stats,
+            "module_list",
+            &userdb_result("module_list", true, "", &envelope),
+        );
+        assert_eq!(stats.modules_live, 3);
+        assert!(stats.modules_ready);
+    }
+
+    #[test]
+    fn an_empty_module_list_is_ready_and_clears_a_stale_loading_state() {
+        let mut stats = GlobalStats {
+            modules_configured: 4,
+            modules_live: 1,
+            modules_ready: false,
+            ..Default::default()
+        };
+        update_stats_from_query(
+            &mut stats,
+            "module_list",
+            &userdb_result("module_list", true, "", &serde_json::json!([])),
+        );
+        assert_eq!(stats.modules_configured, 0);
+        assert_eq!(stats.modules_live, 0);
+        assert!(stats.modules_ready);
     }
 
     fn db_status_result(blob: &str) -> DatabaseQueryResult {

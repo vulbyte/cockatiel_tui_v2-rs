@@ -1232,7 +1232,7 @@ async fn run_app(
             let border_color = state.colors.active_border_color(state.active_window.name());
 
             let status_hotkeys = state.hotkeys.format_global();
-            let status_line = Line::from(vec![
+            let mut status_spans = vec![
                 Span::styled(
                     format!(" {} ", state.active_window.title()),
                     Style::default().fg(Color::Black).bg(border_color),
@@ -1241,11 +1241,30 @@ async fn run_app(
                     format!(" {} ", conn_status),
                     Style::default().fg(conn_color),
                 ),
-                Span::styled(
-                    format!("  {}", status_hotkeys),
-                    Style::default().fg(Color::DarkGray).bg(Color::Black),
-                ),
-            ]);
+            ];
+            // Module-load state is only meaningful while the engine link is up;
+            // without it the loading counter is just stale noise.
+            if state.connected {
+                if state.stats.modules_ready {
+                    status_spans.push(Span::styled(
+                        " modules ready ",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else {
+                    status_spans.push(Span::styled(
+                        format!(
+                            " loading modules {}/{} ",
+                            state.stats.modules_live, state.stats.modules_configured
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+            status_spans.push(Span::styled(
+                format!("  {}", status_hotkeys),
+                Style::default().fg(Color::DarkGray).bg(Color::Black),
+            ));
+            let status_line = Line::from(status_spans);
             let status_para = Paragraph::new(status_line);
             status_para.render(status_bar, frame.buffer_mut());
 
