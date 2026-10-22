@@ -195,6 +195,10 @@ impl UsersWindow {
                     format!("{:>8}", format!("{:+}", entry.earned)),
                     row_style(is_selected).fg(earned_color),
                 ),
+                Span::styled(
+                    format!("{:>9}", entry.score),
+                    row_style(is_selected).fg(if is_selected { Color::Black } else { Color::Gray }),
+                ),
             ]);
             line.render(Rect { x: area.x, y, width: area.width, height: 1 }, buf);
         }
@@ -249,7 +253,7 @@ impl Window for UsersWindow {
         // The column header (one row), then the rows, then the filter/error
         // lines pinned to the bottom.
         let header = Line::from(Span::styled(
-            format!(" {:>3} {:<22}{:>8}", "#", "user", "earned"),
+            format!(" {:>3} {:<22}{:>8}{:>9}", "#", "user", "earned", "total"),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
         header.render(Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 }, buf);
