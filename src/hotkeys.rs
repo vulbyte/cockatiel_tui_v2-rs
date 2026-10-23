@@ -115,6 +115,15 @@ pub enum Action {
     /// modules directory is brought in (the browser resolves the user's choice
     /// before emitting this).
     AdoptModule(std::path::PathBuf, AdoptMode),
+    /// Approve a held-for-audit message (resubmit it as a normal message),
+    /// carrying its uuid7. Produced by the audit window; the payload is filled
+    /// from the window's selection (see `fill_window_action`).
+    AuditApprove(String),
+    /// Reject a held-for-audit message (mark it failed), carrying its uuid7.
+    AuditReject(String),
+    /// Re-fetch the held-for-audit list immediately (`audit_list`), without
+    /// waiting for the next poll tick. Produced by the audit window.
+    AuditRefresh,
     Noop,
 }
 
@@ -262,6 +271,9 @@ fn parse_action(s: &str) -> Action {
         "OpenUsers" => Action::OpenUsers,
         "WindowToggle" => Action::WindowToggle,
         "OpenModuleBrowser" => Action::OpenModuleBrowser,
+        "AuditApprove" => Action::AuditApprove(String::new()),
+        "AuditReject" => Action::AuditReject(String::new()),
+        "AuditRefresh" => Action::AuditRefresh,
         _ => Action::Noop,
     }
 }
@@ -371,6 +383,9 @@ pub fn action_label(action: &Action) -> &'static str {
         Action::OpenUsers => "users",
         Action::OpenModuleBrowser => "new-module",
         Action::AdoptModule(_, _) => "add",
+        Action::AuditApprove(_) => "approve",
+        Action::AuditReject(_) => "reject",
+        Action::AuditRefresh => "audit-refresh",
         Action::Quit => "quit",
         Action::FocusNext => "window-next",
         Action::FocusPrev => "window-prev",
@@ -665,6 +680,15 @@ pub fn default_hotkeys() -> HotkeyConfig {
     let mut window_actions = HashMap::new();
     window_actions.insert("modules".to_string(), module_actions);
     window_actions.insert("chart".to_string(), chart_actions);
+    // The audit view: `a` approves the selected held message, `x` rejects it,
+    // `r` re-fetches the list. Navigation (j/k/g/G/pgup/pgdn) is handled inside
+    // the window. The trailing payload is filled from the window's selection by
+    // `fill_window_action`, exactly like a module action's name.
+    let mut audit_actions = HashMap::new();
+    audit_actions.insert(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()), Action::AuditApprove(String::new()));
+    audit_actions.insert(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()), Action::AuditReject(String::new()));
+    audit_actions.insert(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()), Action::AuditRefresh);
+    window_actions.insert("audit".to_string(), audit_actions);
 
     HotkeyConfig {
         global,

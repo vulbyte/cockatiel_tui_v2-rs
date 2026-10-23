@@ -114,6 +114,16 @@ pub const TERMINAL_EMULATOR_KEY: &str = "terminal_emulator";
 /// FIRST in discovery order.
 pub const TERMINAL_EMULATORS_KEY: &str = "terminal_emulators";
 
+/// The TUI's `config.json` key: how many held-for-audit rows the audit pane
+/// asks the engine for (`audit_list`'s `limit`). Positive row counts only; a
+/// missing or non-positive value falls back to
+/// [`crate::db::DEFAULT_AUDIT_LIMIT`].
+pub const AUDIT_LIMIT_KEY: &str = "audit_limit";
+
+/// Default backfilled for [`AUDIT_LIMIT_KEY`]. Kept in step with
+/// [`crate::db::DEFAULT_AUDIT_LIMIT`].
+const DEFAULT_AUDIT_LIMIT: i64 = crate::db::DEFAULT_AUDIT_LIMIT as i64;
+
 /// Substrings that mark a name as a terminal emulator (case-insensitive).
 /// Broad enough to catch common emulators (Terminal, iTerm, WezTerm, Ghostty,
 /// cool-retro-term, Alacritty, Kitty, Warp, Hyper, Tabby, Konsole, xterm,
@@ -420,6 +430,20 @@ pub fn read_launch_engine_default(path: &Path) -> Option<bool> {
     config.get(LAUNCH_ENGINE_KEY).and_then(|v| v.as_bool())
 }
 
+/// The TUI's `audit_limit` setting, or `None` when the file is missing, is not
+/// an object, or has no usable value for the key. A non-positive value is also
+/// `None`, so the caller falls back to the shipped default rather than asking
+/// the engine for zero rows. The mirror of [`read_launch_engine_default`].
+pub fn read_audit_limit(path: &Path) -> Option<i32> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+    config
+        .get(AUDIT_LIMIT_KEY)
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| n.clamp(1, i32::MAX as i64) as i32)
+}
+
 /// Make sure the TUI's `config.json` exists and carries every default key.
 ///
 /// This is THE writer for that file, so a fresh install (an empty directory, or
@@ -465,6 +489,10 @@ pub fn ensure_tui_config(path: &Path) {
     }
     if !map.contains_key(TERMINAL_EMULATOR_KEY) {
         map.insert(TERMINAL_EMULATOR_KEY.to_string(), serde_json::Value::String(String::new()));
+        changed = true;
+    }
+    if !map.contains_key(AUDIT_LIMIT_KEY) {
+        map.insert(AUDIT_LIMIT_KEY.to_string(), serde_json::Value::Number(DEFAULT_AUDIT_LIMIT.into()));
         changed = true;
     }
     // Re-run the emulator crawl on EVERY startup: merge whatever is currently
@@ -3699,6 +3727,9 @@ mod tests {
         // The terminal emulator defaults to empty (system default).
         assert_eq!(written[TERMINAL_EMULATOR_KEY], serde_json::json!(""));
         assert_eq!(read_terminal_emulator(&path), None);
+        // The audit row count defaults to the shipped value.
+        assert_eq!(written[AUDIT_LIMIT_KEY], serde_json::json!(DEFAULT_AUDIT_LIMIT));
+        assert_eq!(read_audit_limit(&path), Some(crate::db::DEFAULT_AUDIT_LIMIT));
 
         // Idempotent, and an operator's own value is never overwritten.
         ensure_tui_config(&path);
@@ -3729,6 +3760,33 @@ mod tests {
         // A non-boolean value is "nothing said", never a guessed `false`.
         std::fs::write(&path, r#"{"launch_engine": "yes"}"#).unwrap();
         assert_eq!(read_launch_engine_default(&path), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn audit_limit_is_read_from_the_tui_config_and_rejects_bad_values() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-auditlimit-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.json");
+
+        // Nothing said -> None (caller falls back to the default).
+        std::fs::write(&path, r#"{"operator_setting": 7}"#).unwrap();
+        assert_eq!(read_audit_limit(&path), None);
+
+        // A real value is returned.
+        std::fs::write(&path, r#"{"audit_limit": 250}"#).unwrap();
+        assert_eq!(read_audit_limit(&path), Some(250));
+
+        // Zero/negative are "nothing usable", never a request for zero rows.
+        std::fs::write(&path, r#"{"audit_limit": 0}"#).unwrap();
+        assert_eq!(read_audit_limit(&path), None);
+        std::fs::write(&path, r#"{"audit_limit": -5}"#).unwrap();
+        assert_eq!(read_audit_limit(&path), None);
+
+        // A non-number is also "nothing said".
+        std::fs::write(&path, r#"{"audit_limit": "lots"}"#).unwrap();
+        assert_eq!(read_audit_limit(&path), None);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

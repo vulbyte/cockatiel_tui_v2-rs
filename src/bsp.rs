@@ -48,6 +48,7 @@ pub enum ViewType {
     TopUsers,
     StreamManager,
     UserManagement,
+    Audit,
 }
 
 impl ViewType {
@@ -61,6 +62,7 @@ impl ViewType {
             ViewType::TopUsers,
             ViewType::StreamManager,
             ViewType::UserManagement,
+            ViewType::Audit,
         ]
     }
 
@@ -74,6 +76,7 @@ impl ViewType {
             ViewType::TopUsers => "top_users",
             ViewType::StreamManager => "stream_manager",
             ViewType::UserManagement => "user_management",
+            ViewType::Audit => "audit",
         }
     }
 
@@ -92,6 +95,7 @@ impl ViewType {
             ViewType::TopUsers => WindowId::Users,
             ViewType::StreamManager => WindowId::StreamManager,
             ViewType::UserManagement => WindowId::UserManagement,
+            ViewType::Audit => WindowId::Audit,
         }
     }
 }
@@ -350,8 +354,8 @@ pub fn make_window(view: ViewType) -> Box<dyn Window> {
         return m.make_surface();
     }
     use crate::windows::{
-        ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow, StreamManagerWindow,
-        UserManagementWindow, UsersWindow,
+        AuditWindow, ChartWindow, LogWindow, LogoWindow, ModulesWindow, PromptsWindow,
+        StreamManagerWindow, UserManagementWindow, UsersWindow,
     };
     match view {
         ViewType::CockatielInfo => Box::new(LogoWindow),
@@ -362,6 +366,7 @@ pub fn make_window(view: ViewType) -> Box<dyn Window> {
         ViewType::TopUsers => Box::new(UsersWindow::new()),
         ViewType::StreamManager => Box::new(StreamManagerWindow::new()),
         ViewType::UserManagement => Box::new(UserManagementWindow::new()),
+        ViewType::Audit => Box::new(AuditWindow::new()),
     }
 }
 

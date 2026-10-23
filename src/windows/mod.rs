@@ -6,6 +6,7 @@ pub mod prompts;
 pub mod users;
 pub mod user_management;
 pub mod stream_manager;
+pub mod audit;
 pub mod hotkey_wrap;
 
 pub use logo::LogoWindow;
@@ -16,3 +17,4 @@ pub use prompts::PromptsWindow;
 pub use users::UsersWindow;
 pub use user_management::UserManagementWindow;
 pub use stream_manager::StreamManagerWindow;
+pub use audit::AuditWindow;

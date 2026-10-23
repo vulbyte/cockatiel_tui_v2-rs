@@ -121,6 +121,10 @@ pub enum WindowId {
     /// (reprimand / commendation / score adjust / link account). Like `Users`,
     /// NOT part of the embedded window cycle.
     UserManagement,
+    /// Audit view: held-for-review messages, approved or rejected in place. The
+    /// data is TUI-only (the engine gates `audit_list`/`audit_approve`/
+    /// `audit_reject` to the control surface).
+    Audit,
 }
 
 impl WindowId {
@@ -134,6 +138,7 @@ impl WindowId {
             WindowId::Users => "users",
             WindowId::StreamManager => "stream_manager",
             WindowId::UserManagement => "user_management",
+            WindowId::Audit => "audit",
         }
     }
 
@@ -147,6 +152,7 @@ impl WindowId {
             WindowId::Users => "user database",
             WindowId::StreamManager => "stream manager",
             WindowId::UserManagement => "user management",
+            WindowId::Audit => "audit",
         }
     }
 }
@@ -199,6 +205,13 @@ pub trait Window {
     /// The module currently selected in this window (used to fill in the name
     /// for module actions resolved from the hotkey config).
     fn selected_module_name(&self, _stats: &GlobalStats) -> Option<String> { None }
+    /// The uuid7 of the held-for-audit message currently selected in this
+    /// window, if any. The mirror of [`Window::selected_module_name`] for the
+    /// audit view: the audit actions (`audit_approve` / `audit_reject`) are
+    /// bound in the key map with an empty payload, and this is what
+    /// `fill_window_action` resolves the target from. Default `None` because a
+    /// window with no audit list has no message to act on.
+    fn selected_audit_uuid(&self, _stats: &GlobalStats) -> Option<String> { None }
     /// Whether the focused window's selection IS a module, i.e. whether the
     /// per-module actions (start/stop/delete/...) have anything to act on.
     ///
@@ -356,6 +369,11 @@ pub struct AppState {
     /// `terminal_emulator` key). Empty/None = the system default. Used to open
     /// terminal modules and pop-out windows.
     pub terminal_emulator: Option<String>,
+    /// How many held-for-audit rows the engine is asked for (`audit_limit` in
+    /// the TUI's own config.json). Read once at startup and used when the audit
+    /// poll is built, so the per-window query stays gated but sized to the
+    /// operator's setting instead of a hardcoded number.
+    pub audit_limit: i32,
     /// Set by the Ctrl+L escape hatch: repaint every cell on the next frame
     /// instead of diffing, so any visual glitch can be cleared by hand.
     pub force_full_redraw: bool,
@@ -498,6 +516,7 @@ impl AppState {
             tts_enabled: false,
             tts: Box::new(crate::tts::MutedBackend),
             terminal_emulator: None,
+            audit_limit: crate::db::DEFAULT_AUDIT_LIMIT,
             force_full_redraw: false,
             stats: GlobalStats::default(),
             colors,

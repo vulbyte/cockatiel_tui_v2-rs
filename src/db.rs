@@ -88,6 +88,26 @@ pub struct LeaderboardEntry {
     pub score: i32,
 }
 
+/// One held-for-review message from the engine's `audit_list` (the timeline's
+/// `pipeline_status = 'audit'` rows). The engine's row carries the flags column
+/// under the key `reason`.
+#[derive(Debug, Clone, Default)]
+pub struct AuditEntry {
+    pub uuid7: String,
+    pub platform: String,
+    pub raw_message: String,
+    pub user_uuid7: String,
+    pub reason: String,
+    /// When the message was persisted, epoch milliseconds. `None` when the
+    /// engine could not read it (the column is nullable).
+    pub persisted_at: Option<i64>,
+}
+
+/// Default `audit_limit`: how many held-for-audit rows the TUI asks the engine
+/// for when the operator has not set one. Mirrors the audit-viewer module's
+/// shipped default.
+pub const DEFAULT_AUDIT_LIMIT: i32 = 100;
+
 /// One platform adapter's report of applying the current stream control.
 #[derive(Debug, Clone, Default)]
 pub struct StreamControlStatusView {
@@ -205,6 +225,12 @@ pub struct GlobalStats {
     /// The desired stream control + adapter statuses, polled via
     /// `stream_schedule`. Edited by the stream-manager window.
     pub stream_schedule: StreamScheduleView,
+    /// Held-for-review messages, polled via `audit_list` (TUI-only). Rendered
+    /// and acted on by the audit window.
+    pub audit_entries: Vec<AuditEntry>,
+    /// Monotonic counter bumped on every `audit_list` response, so the audit
+    /// window can tell "no held messages" from "not loaded yet".
+    pub audit_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +272,8 @@ impl Default for GlobalStats {
             user_last_error: None,
             leaderboard: Vec::new(),
             stream_schedule: StreamScheduleView::default(),
+            audit_entries: Vec::new(),
+            audit_epoch: 0,
         }
     }
 }
@@ -479,6 +507,26 @@ pub fn update_stats_from_query(stats: &mut GlobalStats, query_id: &str, result: 
         }
         return;
     }
+    // audit_list is a plain JSON array of held-for-audit rows (the engine's
+    // timeline `pipeline_status = 'audit'` set), not an envelope. Parsed here so
+    // the audit window renders straight from `GlobalStats`, like the leaderboard.
+    if query_id == "audit_list" && result.success {
+        if let Some(rows) = parse_query_result(result) {
+            stats.audit_entries = rows
+                .iter()
+                .map(|r| AuditEntry {
+                    uuid7: r.get("uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    platform: r.get("platform").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    raw_message: r.get("raw_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    user_uuid7: r.get("user_uuid7").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    reason: r.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    persisted_at: r.get("persisted_at").and_then(|v| v.as_i64()),
+                })
+                .collect();
+            stats.audit_epoch = stats.audit_epoch.wrapping_add(1);
+        }
+        return;
+    }
     // stats is a JSON object (not a row array) from the engine's Phase-2
     // `stats` op: all timeline aggregates in one response.
     if query_id == "stats" && result.success {
@@ -627,13 +675,20 @@ pub fn core_queries() -> Vec<(&'static str, String)> {
 /// Queries polled ONLY while their owning window is open. Each maps to exactly
 /// the window that renders its result: `stream_leaderboard` → the top-users
 /// view, `userdb_list_users` → user management, `stream_schedule` → the stream
-/// manager. These are the heavier per-window reads; not firing them while their
-/// window is closed is the whole point — it lets the poll load scale with what
-/// is on screen instead of running unconditionally every tick.
+/// manager, `audit_list` → the audit view. These are the heavier per-window
+/// reads; not firing them while their window is closed is the whole point — it
+/// lets the poll load scale with what is on screen instead of running
+/// unconditionally every tick.
+///
+/// `audit_limit` is the operator's configured row count (the TUI's
+/// `audit_limit` setting); it is only baked into the `audit_list` payload when
+/// that window is open.
 pub fn extended_queries(
     show_top_users: bool,
     show_user_admin: bool,
     show_stream: bool,
+    show_audit: bool,
+    audit_limit: i32,
 ) -> Vec<(&'static str, String)> {
     let mut q = Vec::new();
     if show_top_users {
@@ -644,6 +699,13 @@ pub fn extended_queries(
     }
     if show_stream {
         q.push(("stream_schedule", "{}".to_string())); // virtual: desired stream control + adapter statuses
+    }
+    if show_audit {
+        let limit = if audit_limit > 0 { audit_limit } else { DEFAULT_AUDIT_LIMIT };
+        q.push((
+            "audit_list",
+            serde_json::json!({ "limit": limit, "offset": 0 }).to_string(),
+        )); // virtual: held-for-audit messages (TUI-only)
     }
     q
 }
@@ -905,16 +967,16 @@ mod tests {
     fn each_extended_query_is_gated_on_its_own_window() {
         let has = |qs: &[(&'static str, String)], id: &str| qs.iter().any(|(i, _)| *i == id);
 
-        // (show_top_users, show_user_admin, show_stream)
-        assert!(extended_queries(false, false, false).is_empty());
+        // (show_top_users, show_user_admin, show_stream, show_audit, audit_limit)
+        assert!(extended_queries(false, false, false, false, 100).is_empty());
 
         // Top-users window → the cached leaderboard.
-        let users = extended_queries(true, false, false);
+        let users = extended_queries(true, false, false, false, 100);
         assert!(has(&users, "stream_leaderboard"));
         assert!(!has(&users, "userdb_list_users"));
 
         // User-management window → the user list, with the expected payload.
-        let admin = extended_queries(false, true, false);
+        let admin = extended_queries(false, true, false, false, 100);
         let userdb = admin
             .iter()
             .find(|(id, _)| *id == "userdb_list_users")
@@ -923,15 +985,72 @@ mod tests {
         assert_eq!(payload["limit"], 500);
 
         // Stream-manager window → the schedule/control status.
-        assert!(has(&extended_queries(false, false, true), "stream_schedule"));
+        assert!(has(&extended_queries(false, false, true, false, 100), "stream_schedule"));
+
+        // Audit window → the held messages, sized by the configured limit.
+        let audit = extended_queries(false, false, false, true, 25);
+        let audit_q = audit
+            .iter()
+            .find(|(id, _)| *id == "audit_list")
+            .expect("audit window polls the held list");
+        let audit_payload: serde_json::Value = serde_json::from_str(&audit_q.1).unwrap();
+        assert_eq!(audit_payload["limit"], 25);
+        assert_eq!(audit_payload["offset"], 0);
+        // A non-positive configured limit falls back to the default.
+        let fallback = extended_queries(false, false, false, true, 0);
+        let fb = fallback.iter().find(|(id, _)| *id == "audit_list").unwrap();
+        let fb_payload: serde_json::Value = serde_json::from_str(&fb.1).unwrap();
+        assert_eq!(fb_payload["limit"], DEFAULT_AUDIT_LIMIT);
 
         // The always-on core set must never include a heavy per-window read.
         assert!(core_queries().iter().all(|(id, _)| ![
             "userdb_list_users",
             "stream_leaderboard",
-            "stream_schedule"
+            "stream_schedule",
+            "audit_list"
         ]
         .contains(id)));
+    }
+
+    #[test]
+    fn parses_audit_list_into_stats() {
+        let mut stats = GlobalStats::default();
+        // The engine answers `audit_list` with a plain array of held rows; the
+        // flags column arrives under the key `reason`, and `persisted_at` may be
+        // null.
+        let envelope = serde_json::json!([
+            {
+                "uuid7": "a1", "platform": "twitch", "raw_message": "held one",
+                "user_uuid7": "u1", "reason": "{\"kind\":\"review\"}", "persisted_at": 1700000000000i64
+            },
+            {
+                "uuid7": "a2", "platform": "youtube", "raw_message": "held two",
+                "user_uuid7": null, "reason": null, "persisted_at": null
+            }
+        ]);
+        let result = userdb_result("audit_list", true, "", &envelope);
+        update_stats_from_query(&mut stats, "audit_list", &result);
+
+        assert_eq!(stats.audit_entries.len(), 2);
+        assert_eq!(stats.audit_entries[0].uuid7, "a1");
+        assert_eq!(stats.audit_entries[0].platform, "twitch");
+        assert_eq!(stats.audit_entries[0].reason, "{\"kind\":\"review\"}");
+        assert_eq!(stats.audit_entries[0].persisted_at, Some(1700000000000));
+        // Nulls collapse to empty/None rather than failing the row.
+        assert_eq!(stats.audit_entries[1].user_uuid7, "");
+        assert_eq!(stats.audit_entries[1].reason, "");
+        assert_eq!(stats.audit_entries[1].persisted_at, None);
+        assert_eq!(stats.audit_epoch, 1, "an audit reply bumps the loaded epoch");
+
+        // An empty list (nothing held) still counts as a loaded reply.
+        let empty = userdb_result("audit_list", true, "", &serde_json::json!([]));
+        update_stats_from_query(&mut stats, "audit_list", &empty);
+        assert!(stats.audit_entries.is_empty());
+        assert_eq!(stats.audit_epoch, 2);
+        // A failed list leaves the last-known rows and epoch untouched.
+        let failed = userdb_result("audit_list", false, "audit_list failed", &serde_json::json!([]));
+        update_stats_from_query(&mut stats, "audit_list", &failed);
+        assert_eq!(stats.audit_epoch, 2);
     }
 
     #[test]

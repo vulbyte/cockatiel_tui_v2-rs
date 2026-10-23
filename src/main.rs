@@ -415,6 +415,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.terminal_emulator =
         supervisor::first_enabled_terminal_emulator(&tui_config_path)
             .or_else(|| supervisor::read_terminal_emulator(&tui_config_path));
+    // The audit pane's row count, read from the same config file (backfilled by
+    // `ensure_tui_config` above). Falls back to the shipped default only if the
+    // key is missing/unreadable, so a bad edit never requests zero rows.
+    state.audit_limit = supervisor::read_audit_limit(&tui_config_path)
+        .unwrap_or(crate::db::DEFAULT_AUDIT_LIMIT);
 
     // Auto-rebuild channel: a crashed module's name is sent here and the main
     // loop rebuilds + relaunches it (capped to avoid infinite loops).
@@ -450,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "prompts" => crate::bsp::ViewType::Prompts,
             "users" => crate::bsp::ViewType::TopUsers,
             "user_management" => crate::bsp::ViewType::UserManagement,
+            "audit" => crate::bsp::ViewType::Audit,
             _ => crate::bsp::ViewType::CockatielInfo,
         };
         state.tree = crate::bsp::single_tree(view);
@@ -689,11 +695,13 @@ fn poll_set_for(state: &AppState) -> Vec<(String, String)> {
     let mut show_top_users = false;
     let mut show_user_admin = false;
     let mut show_stream = false;
+    let mut show_audit = false;
     for (_name, view, _rect, _focused) in state.tree.leaves() {
         match view {
             ViewType::TopUsers => show_top_users = true,
             ViewType::UserManagement => show_user_admin = true,
             ViewType::StreamManager => show_stream = true,
+            ViewType::Audit => show_audit = true,
             _ => {}
         }
     }
@@ -704,6 +712,7 @@ fn poll_set_for(state: &AppState) -> Vec<(String, String)> {
             "users" => show_top_users = true,
             "user_management" => show_user_admin = true,
             "stream_manager" => show_stream = true,
+            "audit" => show_audit = true,
             _ => {}
         }
     }
@@ -711,7 +720,13 @@ fn poll_set_for(state: &AppState) -> Vec<(String, String)> {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    for (k, v) in crate::db::extended_queries(show_top_users, show_user_admin, show_stream) {
+    for (k, v) in crate::db::extended_queries(
+        show_top_users,
+        show_user_admin,
+        show_stream,
+        show_audit,
+        state.audit_limit,
+    ) {
         set.push((k.to_string(), v));
     }
     set
@@ -2207,6 +2222,9 @@ fn is_dispatchable(action: &Action) -> bool {
             | Action::WindowToggle
             | Action::OpenModuleBrowser
             | Action::AdoptModule(_, _)
+            | Action::AuditApprove(_)
+            | Action::AuditReject(_)
+            | Action::AuditRefresh
     )
 }
 
@@ -2320,6 +2338,15 @@ fn selected_module_name(state: &AppState) -> String {
         .unwrap_or_default()
 }
 
+/// The uuid7 of the held-for-audit message selected in the active window, if
+/// any. The audit mirror of [`selected_module_name`]: only the audit window
+/// answers, every other window returns `None`.
+fn selected_audit_uuid(state: &AppState) -> Option<String> {
+    state
+        .window_by_id(state.active_window)
+        .and_then(|w| w.selected_audit_uuid(&state.stats))
+}
+
 /// Fill in the module/window name for name-bearing actions resolved from the
 /// hotkey config (which stores them with an empty payload).
 fn fill_window_action(state: &AppState, window_name: &str, action: Action) -> Action {
@@ -2335,6 +2362,11 @@ fn fill_window_action(state: &AppState, window_name: &str, action: Action) -> Ac
         Action::EditCredentials(_) => Action::EditCredentials(name),
         Action::EditConfig(_) => Action::EditConfig(name),
         Action::ClearModuleConfig(_) => Action::ClearModuleConfig(name),
+        // The audit actions resolve their target the same way a module action
+        // resolves its name: the key map stores them with an empty payload and
+        // `fill_window_action` fills in the selected held message's uuid7.
+        Action::AuditApprove(_) => Action::AuditApprove(selected_audit_uuid(state).unwrap_or_default()),
+        Action::AuditReject(_) => Action::AuditReject(selected_audit_uuid(state).unwrap_or_default()),
         // PopOut carries its own window name when the binding set one (e.g.
         // `u` → PopOut("users")); an empty payload falls back to the current
         // window (the `w` per-window popout behavior).
@@ -3763,6 +3795,29 @@ async fn dispatch_action(
             // One-shot user-database query from the detached users window.
             send_engine_query(ws_command_tx, query_id, sql);
         }
+        Action::AuditApprove(uuid7) => {
+            // Approve a held-for-audit message, then re-fetch the list so the
+            // row leaves the pane without waiting for the next poll tick.
+            if let Some(msg) = audit_action_blocked(state.connected, &uuid7) {
+                supervisor_log(state, msg);
+                return Ok(false);
+            }
+            send_audit_action(ws_command_tx, "audit_approve", &uuid7, state.audit_limit);
+        }
+        Action::AuditReject(uuid7) => {
+            if let Some(msg) = audit_action_blocked(state.connected, &uuid7) {
+                supervisor_log(state, msg);
+                return Ok(false);
+            }
+            send_audit_action(ws_command_tx, "audit_reject", &uuid7, state.audit_limit);
+        }
+        Action::AuditRefresh => {
+            if !state.connected {
+                supervisor_log(state, "[supervisor] cannot refresh the audit list — engine disconnected");
+                return Ok(false);
+            }
+            send_engine_query(ws_command_tx, "audit_list".to_string(), audit_list_payload(state.audit_limit));
+        }
         Action::TogglePipelinePause => {
             // The gate lives in the engine, so an unreachable engine is the one
             // case where the toggle cannot be honoured — say so instead of
@@ -3885,6 +3940,42 @@ fn pipeline_pause_toggle_sql(paused: bool) -> String {
 /// Send a one-shot query to the engine (via the WebSocket command channel).
 fn send_engine_query(ws_command_tx: &mpsc::UnboundedSender<WsCommand>, query_id: String, sql: String) {
     let _ = ws_command_tx.send(WsCommand::SendQuery { query_id, sql });
+}
+
+/// The `audit_list` payload for the configured row count. A non-positive value
+/// falls back to [`crate::db::DEFAULT_AUDIT_LIMIT`] so the window never asks the
+/// engine for zero rows.
+fn audit_list_payload(limit: i32) -> String {
+    let limit = if limit > 0 { limit } else { crate::db::DEFAULT_AUDIT_LIMIT };
+    serde_json::json!({ "limit": limit, "offset": 0 }).to_string()
+}
+
+/// Why an approve/reject must be refused, or `None` when it may proceed. Split
+/// out so both audit actions share the exact same guard.
+fn audit_action_blocked(connected: bool, uuid7: &str) -> Option<&'static str> {
+    if !connected {
+        return Some("[supervisor] cannot action a held message — engine disconnected");
+    }
+    if uuid7.is_empty() {
+        return Some("[supervisor] no held message selected to review");
+    }
+    None
+}
+
+/// Send an approve/reject write for `uuid7` and immediately re-fetch the list,
+/// so the reviewed row leaves the pane without waiting for the next poll.
+fn send_audit_action(
+    ws_command_tx: &mpsc::UnboundedSender<WsCommand>,
+    query_id: &str,
+    uuid7: &str,
+    limit: i32,
+) {
+    send_engine_query(
+        ws_command_tx,
+        query_id.to_string(),
+        serde_json::json!({ "uuid7": uuid7 }).to_string(),
+    );
+    send_engine_query(ws_command_tx, "audit_list".to_string(), audit_list_payload(limit));
 }
 
 // ── removing the engine from the TUI ───────────────────────────────────
