@@ -869,36 +869,7 @@ async fn run_app(
             }
             maybe_rebuild = rebuild_rx.recv() => {
                 if let Some(name) = maybe_rebuild {
-                    // A module crashed before connecting (e.g. a corrupt or
-                    // mismatched prebuilt binary). Rebuild it from source and
-                    // relaunch — but cap attempts so we don't loop forever.
-                    let attempts = {
-                        let mut m = state.rebuild_attempts.lock().unwrap();
-                        let n = m.get(&name).copied().unwrap_or(0);
-                        m.insert(name.clone(), n + 1);
-                        n
-                    };
-                    if attempts < 3 {
-                        supervisor_log(state, format!("[supervisor] {} crashed — rebuilding and relaunching (attempt {})", name, attempts + 1));
-                        // Kill the crashed process before removing it from the
-                        // table — `remove` alone would orphan it (untracked,
-                        // never killed on teardown).
-                        if let Some(proc) = supervisor.remove(&name) {
-                            let mut proc = proc.lock().unwrap();
-                            proc.kill();
-                        }
-                        request_launch(
-                            state,
-                            &name,
-                            supervisor,
-                            &plugins,
-                            port,
-                            pin,
-                            supervisor::LaunchMode::Rebuild,
-                        );
-                    } else {
-                        supervisor_log(state, format!("[supervisor] {} crashed {}x — giving up", name, attempts + 1));
-                    }
+                    handle_startup_crash(state, &name, supervisor, &plugins, port, pin).await;
                 }
             }
             maybe_restart = restart_rx.recv() => {
@@ -2902,6 +2873,67 @@ async fn handle_crash(
     });
 }
 
+/// Whether the operator explicitly stopped `name` and no automatic recovery may
+/// relaunch it. A stop (`x`) is a deliberate operator action and must win over
+/// every crash-ladder entry point — the startup rebuild, the runtime restart
+/// and the backoff retry all consult this (or their own "restarting" guard).
+fn explicitly_stopped(state: &AppState, name: &str) -> bool {
+    state
+        .module_runs
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|s| s.as_str())
+        == Some("stopped")
+}
+
+/// Recover a module that exited before the engine ever saw it connect (a corrupt
+/// or mismatched prebuilt binary). Rebuild from source and relaunch, capped so a
+/// doomed build can't loop forever.
+///
+/// This is one of the AUTOMATIC relaunch paths, so it respects an explicit stop
+/// first: a module the operator stopped must never come back because its process
+/// monitor happened to observe the deliberate exit while the run status still
+/// read "starting" — that race is exactly what made `x` look like a no-op.
+async fn handle_startup_crash(
+    state: &mut AppState,
+    name: &str,
+    supervisor: &mut supervisor::ProcessTable,
+    plugins: &[crate::plugins::Plugin],
+    port: u16,
+    pin: u32,
+) {
+    if explicitly_stopped(state, name) {
+        return;
+    }
+    let attempts = {
+        let mut m = state.rebuild_attempts.lock().unwrap();
+        let n = m.get(name).copied().unwrap_or(0);
+        m.insert(name.to_string(), n + 1);
+        n
+    };
+    if attempts >= 3 {
+        supervisor_log(state, format!("[supervisor] {} crashed {}x — giving up", name, attempts + 1));
+        return;
+    }
+    supervisor_log(state, format!("[supervisor] {} crashed — rebuilding and relaunching (attempt {})", name, attempts + 1));
+    // Kill the crashed process before removing it from the table — `remove`
+    // alone would orphan it (untracked, never killed on teardown).
+    if let Some(proc) = supervisor.remove(name) {
+        let mut proc = proc.lock().unwrap();
+        proc.kill();
+    }
+    request_launch(
+        state,
+        name,
+        supervisor,
+        plugins,
+        port,
+        pin,
+        supervisor::LaunchMode::Rebuild,
+    );
+}
+
 /// Set a module's autostart flag in its manifest file on disk.
 fn set_autostart(plugins: &[crate::plugins::Plugin], name: &str, enabled: bool) {
     if let Some(plugin) = plugins.iter().find(|p| p.manifest.name == name) {
@@ -3381,16 +3413,48 @@ async fn dispatch_action(
                 supervisor_log(state, engine_stop_note(&outcome));
                 return Ok(false);
             }
-            if let Some(proc) = supervisor.remove(&name) {
-                let mut proc = proc.lock().unwrap();
-                supervisor_log(state, format!("[supervisor] Killing {} (pid {})", name, proc.pid()));
-                proc.kill();
-            }
+            // Mark the explicit stop BEFORE killing. The process monitor reads
+            // this status when it observes the child's exit, so setting it first
+            // guarantees the monitor sees "stopped" and breaks silently instead
+            // of racing the kill and handing the module to the crash ladder —
+            // which is what let an explicitly-stopped module come back and made
+            // `x` look like a no-op while a prompt was pending.
             state
                 .module_runs
                 .lock()
                 .unwrap()
-                .insert(name, "stopped".to_string());
+                .insert(name.clone(), "stopped".to_string());
+            // A stopped module can no longer answer prompts: drop its queued
+            // prompts (and cancel a credential entry / a pending post-save
+            // launch aimed at it) so nothing stale lingers and no answer is
+            // sent to a dead module.
+            if state
+                .credential_session
+                .as_ref()
+                .map(|s| s.module_name == name)
+                .unwrap_or(false)
+            {
+                cancel_credential_session(state);
+            }
+            if state.pending_launch.as_deref() == Some(name.as_str()) {
+                state.pending_launch = None;
+                state.pending_launch_confirmed = false;
+            }
+            state.pending_prompt.retain(|p| p.prompt.origin != name);
+            if state.pending_prompt.is_empty() {
+                state.selected_prompt = 0;
+            } else {
+                state.selected_prompt = state
+                    .selected_prompt
+                    .min(state.pending_prompt.len() - 1);
+            }
+            if let Some(proc) = supervisor.remove(&name) {
+                let mut proc = proc.lock().unwrap();
+                supervisor_log(state, format!("[supervisor] Killing {} (pid {})", name, proc.pid()));
+                proc.kill();
+            } else {
+                supervisor_log(state, format!("[supervisor] {} is not running (nothing to kill)", name));
+            }
         }
         Action::DuplicateModule(name) => {
             // Copy the selected module under a NEW name: the engine assigns a
@@ -5902,5 +5966,188 @@ mod stale_connected_tests {
                 "{status} must never fire the stale check"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod module_stop_tests {
+    //! Stopping a module must work no matter what the module is doing — in
+    //! particular while it is parked on a Prompt awaiting the operator. These
+    //! tests pin the two halves of that guarantee: `StopModule` really kills the
+    //! tracked child and clears its stale prompt, and no automatic recovery path
+    //! may relaunch a module the operator explicitly stopped.
+    use super::*;
+    use crate::app::{PendingPrompt, Window, WindowId};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// App state with the `youtube-adapter` module row selected and a pending
+    /// `"No active streams found"` prompt from it — the exact reported shape.
+    fn module_state(status: &str) -> AppState {
+        let mut s = AppState::new(
+            crate::colors::load_colors(&std::path::PathBuf::from("")),
+            crate::hotkeys::default_hotkeys(),
+        );
+        s.connected = true;
+        s.stats.engine_status = "connected".to_string();
+        s.stats.module_entries = vec![crate::db::ModuleStatus {
+            name: "youtube-adapter".into(),
+            description: String::new(),
+            status: "connected".into(),
+            position: "input".into(),
+            credentials: Vec::new(),
+            credential_values: Default::default(),
+            config_complete: true,
+            alive: true,
+            avg_ms: None,
+            autostart: true,
+            authority: 0,
+            price: 0,
+            min_rank: 0.0,
+        }];
+
+        // The modules window opens on the engine row; move the cursor down onto
+        // the module row so `StopModule` is NOT redirected to the engine.
+        let mut win = crate::windows::ModulesWindow::new();
+        {
+            let mut stats = std::mem::take(&mut s.stats);
+            for _ in 0..8 {
+                win.handle_key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Down,
+                        crossterm::event::KeyModifiers::empty(),
+                    ),
+                    &mut stats,
+                );
+                if win.selection_is_module(&stats) {
+                    break;
+                }
+            }
+            s.stats = stats;
+        }
+        s.tree = crate::bsp::tree_with_window(crate::bsp::ViewType::ModuleManager, Box::new(win));
+        s.active_window = WindowId::Modules;
+
+        s.module_runs
+            .lock()
+            .unwrap()
+            .insert("youtube-adapter".into(), status.into());
+        s.pending_prompt.push_back(PendingPrompt {
+            deadline: Instant::now() + Duration::from_secs(300),
+            prompt: cockatiel_client::proto::Prompt {
+                prompt_id_uuid7: "prompt-1".into(),
+                prompt: "No active streams found".into(),
+                origin: "youtube-adapter".into(),
+                input_label: "Video ID or URL".into(),
+                prompt_type: cockatiel_client::proto::PromptType::String as i32,
+                ..Default::default()
+            },
+            text_input: String::new(),
+        });
+        s
+    }
+
+    /// A real, long-lived child in its own process group — the same shape every
+    /// supervisor child has, so the group TERM/KILL in `ManagedProcess::kill`
+    /// actually reaches it.
+    fn track_sleep_module(table: &mut supervisor::ProcessTable, name: &str) -> u32 {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 300"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn().expect("spawn a stand-in module");
+        let pid = child.id();
+        table.insert(
+            name.to_string(),
+            Arc::new(Mutex::new(supervisor::ManagedProcess {
+                child,
+                terminal_window: None,
+                terminal_pidfile: None,
+            })),
+        );
+        pid
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_kills_a_prompt_parked_module_and_clears_its_prompt() {
+        let mut s = module_state("connected");
+        let mut table: supervisor::ProcessTable = Default::default();
+        let pid = track_sleep_module(&mut table, "youtube-adapter");
+        let mut plugins: Vec<crate::plugins::Plugin> = Vec::new();
+        let (tx, _rx) = mpsc::unbounded_channel::<WsCommand>();
+
+        dispatch_action(
+            &mut s,
+            Action::StopModule("youtube-adapter".into()),
+            &mut table,
+            &mut plugins,
+            0,
+            0,
+            &tx,
+            "127.0.0.1:1".parse().unwrap(),
+            "",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !table.contains_key("youtube-adapter"),
+            "a stopped module must be untracked"
+        );
+        assert_eq!(
+            s.module_runs
+                .lock()
+                .unwrap()
+                .get("youtube-adapter")
+                .map(|s| s.as_str()),
+            Some("stopped")
+        );
+        assert!(
+            !supervisor::pid_alive(pid as i32),
+            "the module process must be force-killed (TERM -> KILL)"
+        );
+        assert!(
+            s.pending_prompt.is_empty(),
+            "a stopped module's queued prompt must be dropped, not left to time out"
+        );
+    }
+
+    /// The unguarded startup-rebuild path was the hole: a process monitor that
+    /// observed a deliberate stop while the run status still read "starting"
+    /// would hand the module to the rebuild ladder and relaunch it. An explicit
+    /// stop must win.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicitly_stopped_module_is_not_rebuilt() {
+        let mut s = module_state("stopped");
+        let mut table: supervisor::ProcessTable = Default::default();
+        let plugins: Vec<crate::plugins::Plugin> = Vec::new();
+        handle_startup_crash(&mut s, "youtube-adapter", &mut table, &plugins, 0, 0).await;
+        assert!(
+            s.rebuild_attempts.lock().unwrap().is_empty(),
+            "a stopped module must never be queued for a rebuild"
+        );
+        assert!(table.is_empty(), "nothing may be relaunched");
+    }
+
+    /// Contrast: for a genuinely-starting module (not stopped) the rebuild path
+    /// still runs, so the guard is specific rather than disabling recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_starting_module_is_still_rebuilt() {
+        let mut s = module_state("starting");
+        let mut table: supervisor::ProcessTable = Default::default();
+        let plugins: Vec<crate::plugins::Plugin> = Vec::new();
+        handle_startup_crash(&mut s, "youtube-adapter", &mut table, &plugins, 0, 0).await;
+        assert_eq!(
+            s.rebuild_attempts
+                .lock()
+                .unwrap()
+                .get("youtube-adapter")
+                .copied(),
+            Some(1),
+            "a starting crash must still advance the rebuild ladder"
+        );
     }
 }
