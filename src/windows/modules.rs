@@ -2631,7 +2631,12 @@ impl Window for ModulesWindow {
         let lines = grouped_lines(&rows);
         let selected_line = grouped_selected_line(&lines, selected);
         let available_lines = (inner.y + inner.height).saturating_sub(y) as usize;
-        let scroll = scroll_for(selected_line, self.scroll, available_lines, lines.len());
+        // Derive AND persist the scroll each frame. `scroll_for` keeps a
+        // SCROLL_MARGIN band at each edge, so the cursor moves freely through
+        // the middle and the list slides behind it only near an edge — which
+        // needs the scroll to carry across frames.
+        self.scroll = scroll_for(selected_line, self.scroll, available_lines, lines.len());
+        let scroll = self.scroll;
 
         // Modules that currently have an unanswered prompt waiting.
         let prompts_waiting: std::collections::HashSet<&str> =
@@ -3095,12 +3100,13 @@ impl Window for ModulesWindow {
                 // Group headers are DISPLAY-ONLY: selection lands on the engine
                 // row or a module row, so down/up skip the `[NAME]` lines.
                 self.selected = next_selectable(self.selected, total, &rows, 1);
-                self.scroll = grouped_selected_line(&lines, self.selected);
+                // The render derives + persists the scroll (with its margin).
+                // Setting it to the selected LINE here pinned the cursor to the
+                // top of the viewport when scrolling down.
                 Some(Action::Noop)
             }
             KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.selected = next_selectable(self.selected, total, &rows, -1);
-                self.scroll = grouped_selected_line(&lines, self.selected);
                 Some(Action::Noop)
             }
             // Shift+down / Shift+up ask the dispatcher to move the selected
