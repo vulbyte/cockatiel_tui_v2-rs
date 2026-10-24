@@ -880,7 +880,7 @@ impl AppState {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Paragraph, Widget};
-        let bg = if is_active { Color::Cyan } else { Color::DarkGray };
+        let bg = if is_active { self.colors.primary } else { Color::DarkGray };
         let text = Line::from(vec![
             Span::styled(" [v] ", Style::default().fg(Color::Black).bg(bg).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" {} ", view.name()), Style::default().fg(Color::Black).bg(bg)),

@@ -124,6 +124,28 @@ pub const AUDIT_LIMIT_KEY: &str = "audit_limit";
 /// [`crate::db::DEFAULT_AUDIT_LIMIT`].
 const DEFAULT_AUDIT_LIMIT: i64 = crate::db::DEFAULT_AUDIT_LIMIT as i64;
 
+/// The TUI's `config.json` key holding the whole colour scheme. Its scalar
+/// members are backfilled blank so the file advertises them; a blank value
+/// means "use the built-in default" (see [`crate::colors::load_colors`]).
+pub const COLORSCHEME_KEY: &str = "colorscheme";
+
+/// The scalar colour keys inside [`COLORSCHEME_KEY`], in the order they are
+/// written. Blank = the built-in default; a set value is a `#rrggbb` / named
+/// colour.
+const COLORSCHEME_SCALAR_KEYS: &[&str] = &[
+    "primary",
+    "secondary",
+    "background",
+    "active-border",
+    "inactive-border",
+];
+
+/// The colour MAP keys inside [`COLORSCHEME_KEY`]. They are created EMPTY:
+/// absence (or an empty map) means the built-in defaults, so the writer never
+/// dumps the whole default map into the operator's file — it only advertises
+/// that the key exists.
+const COLORSCHEME_MAP_KEYS: &[&str] = &["borders", "status", "platforms"];
+
 /// Substrings that mark a name as a terminal emulator (case-insensitive).
 /// Broad enough to catch common emulators (Terminal, iTerm, WezTerm, Ghostty,
 /// cool-retro-term, Alacritty, Kitty, Warp, Hyper, Tabby, Konsole, xterm,
@@ -494,6 +516,31 @@ pub fn ensure_tui_config(path: &Path) {
     if !map.contains_key(AUDIT_LIMIT_KEY) {
         map.insert(AUDIT_LIMIT_KEY.to_string(), serde_json::Value::Number(DEFAULT_AUDIT_LIMIT.into()));
         changed = true;
+    }
+    // The `colorscheme` object: advertise every scalar key (blank = built-in
+    // default) and the three colour maps (empty = defaults), without writing
+    // the default map CONTENTS in. An existing value is never overwritten, and
+    // a key a config predates is added.
+    {
+        let cs = map
+            .entry(COLORSCHEME_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        // A non-object colorscheme is not ours to reinterpret; leave it alone
+        // (the reader then falls back to the defaults).
+        if let Some(cs) = cs.as_object_mut() {
+            for key in COLORSCHEME_SCALAR_KEYS {
+                if !cs.contains_key(*key) {
+                    cs.insert((*key).to_string(), serde_json::Value::String(String::new()));
+                    changed = true;
+                }
+            }
+            for key in COLORSCHEME_MAP_KEYS {
+                if !cs.contains_key(*key) {
+                    cs.insert((*key).to_string(), serde_json::Value::Object(serde_json::Map::new()));
+                    changed = true;
+                }
+            }
+        }
     }
     // Re-run the emulator crawl on EVERY startup: merge whatever is currently
     // installed into the toggle map (a newly installed emulator appears even if
@@ -3787,6 +3834,50 @@ mod tests {
         // A non-number is also "nothing said".
         std::fs::write(&path, r#"{"audit_limit": "lots"}"#).unwrap();
         assert_eq!(read_audit_limit(&path), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The writer advertises the whole `colorscheme` shape — the scalar keys
+    /// blank (blank = built-in default) and the three maps empty (absence =
+    /// defaults) — without dumping the default map CONTENTS in, and never
+    /// clobbers a value the operator already set.
+    #[test]
+    fn the_tui_config_writer_backfills_the_colorscheme_shape() {
+        let tmp = std::env::temp_dir().join(format!("cockatiel-colorcfg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.json");
+
+        ensure_tui_config(&path);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cs = &written[COLORSCHEME_KEY];
+        assert!(cs.is_object(), "colorscheme must be an object");
+        for key in COLORSCHEME_SCALAR_KEYS {
+            assert_eq!(cs[*key], serde_json::json!(""), "{key} must be backfilled blank");
+        }
+        for key in COLORSCHEME_MAP_KEYS {
+            assert_eq!(
+                cs[*key],
+                serde_json::json!({}),
+                "{key} must be created empty (the defaults are not written in)"
+            );
+        }
+
+        // An operator's own value survives a later write.
+        std::fs::write(
+            &path,
+            r##"{"colorscheme":{"primary":"#112233","borders":{"modules":"green"}}}"##,
+        )
+        .unwrap();
+        ensure_tui_config(&path);
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(merged[COLORSCHEME_KEY]["primary"], serde_json::json!("#112233"));
+        assert_eq!(merged[COLORSCHEME_KEY]["borders"]["modules"], serde_json::json!("green"));
+        // The keys it did not set are still advertised.
+        assert_eq!(merged[COLORSCHEME_KEY]["secondary"], serde_json::json!(""));
+        assert_eq!(merged[COLORSCHEME_KEY]["status"], serde_json::json!({}));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

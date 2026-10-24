@@ -242,7 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let should_launch = should_launch_engine(cli.engine_launch, config_launch_engine);
 
     let hotkeys = load_hotkeys(&config_dir.join("hotkey_config.json"));
-    let colors = load_colors(&config_dir.join("color_config.json"));
+    // Colours come from the `colorscheme` object in the TUI's own config.json,
+    // with the legacy sibling `color_config.json` still merged underneath it.
+    let colors = load_colors(&tui_config_path);
 
     let (mut ip, mut port, mut pin) = find_engine_addr();
     if let Some(v) = override_ip { ip = v; }
@@ -1190,6 +1192,12 @@ async fn run_app(
 
         terminal.draw(|frame| {
             let size = frame.area();
+            // The configured app background paints every cell first (a
+            // `Color::Reset` background leaves the terminal's own background
+            // untouched), so windows and the status bar render on top of it.
+            frame
+                .buffer_mut()
+                .set_style(size, Style::default().bg(state.colors.background));
             // The BSP tree owns the main area; the one-row status bar sits at
             // the bottom, outside the tree.
             let main_area = Rect {

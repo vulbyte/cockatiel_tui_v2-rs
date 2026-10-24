@@ -193,13 +193,28 @@ pub fn grouped_rows(stats: &GlobalStats) -> Vec<GroupedRow> {
         kind: EntryKind::Engine,
     });
     for group in PIPELINE_GROUPS {
-        let members: Vec<usize> = stats
+        let mut members: Vec<usize> = stats
             .module_entries
             .iter()
             .enumerate()
             .filter(|(_, m)| group_for_position(&m.position) == group)
             .map(|(i, _)| i)
             .collect();
+        // Modules are listed ALPHABETICALLY by name within their stage, so the
+        // list is stable and scannable regardless of the order the engine
+        // reported them in. This is done HERE, where the groups are built, so
+        // the render AND `self.selected` index the same order (a sort at render
+        // time only would leave the selection pointing at the wrong row).
+        // Case-insensitive, with a case-sensitive tiebreak so two names that
+        // differ only in case still have a deterministic order; the sort is
+        // stable, so everything else keeps the engine's order.
+        members.sort_by(|a, b| {
+            let na = &stats.module_entries[*a].name;
+            let nb = &stats.module_entries[*b].name;
+            na.to_ascii_lowercase()
+                .cmp(&nb.to_ascii_lowercase())
+                .then_with(|| na.cmp(nb))
+        });
         rows.push(GroupedRow {
             group,
             kind: EntryKind::Header,
@@ -1844,7 +1859,7 @@ fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, color
                     };
                     let hline = Line::from(Span::styled(
                         format!(" {}", header),
-                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        Style::default().fg(colors.secondary).add_modifier(Modifier::BOLD),
                     ));
                     hline.render(Rect { x: inner.x, y, width: inner.width, height: 1 }, buf);
                     y += 1;
@@ -4916,6 +4931,66 @@ mod engine_row_tests {
             "the groups must appear in pipeline order, each headed by its own \
              header and holding its own modules"
         );
+    }
+
+    /// Modules are listed alphabetically (case-insensitively) within their
+    /// stage group, and the selection indexes the SAME sorted order — so the
+    /// highlighted row always names the module the action fires on.
+    #[test]
+    fn grouped_rows_sorts_modules_alphabetically_within_each_group() {
+        // Deliberately unsorted input, with a case difference to prove the
+        // comparison is case-insensitive.
+        let stats = stats_with(&[
+            ("Zebra", "preprocess"),
+            ("alpha", "preprocess"),
+            ("Mike", "preprocess"),
+            ("bravo", "preprocess"),
+            ("delta", "inprocess"),
+            ("charlie", "inprocess"),
+        ]);
+        let rows = grouped_rows(&stats);
+
+        // Headers still come first, and names are sorted within each group.
+        let names_in = |group: Group| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut seen_header = false;
+            for r in &rows {
+                if r.group != group {
+                    continue;
+                }
+                match r.kind {
+                    EntryKind::Header => {
+                        seen_header = true;
+                        out.clear();
+                    }
+                    EntryKind::Module(i) => {
+                        assert!(seen_header, "a module must follow its group header");
+                        out.push(stats.module_entries[i].name.clone());
+                    }
+                    EntryKind::Engine => {}
+                }
+            }
+            out
+        };
+
+        assert_eq!(
+            names_in(Group::PreProcess),
+            vec!["alpha", "bravo", "Mike", "Zebra"],
+            "pre-process modules must be alphabetical, case-insensitively"
+        );
+        assert_eq!(
+            names_in(Group::InProcess),
+            vec!["charlie", "delta"],
+            "each group sorts independently"
+        );
+
+        // The selection indexes the same order: the first module row in a group
+        // resolves to the alphabetically-first module.
+        let first_pre = rows
+            .iter()
+            .find(|r| r.group == Group::PreProcess && matches!(r.kind, EntryKind::Module(_)))
+            .and_then(|r| r.module_name(&stats));
+        assert_eq!(first_pre.as_deref(), Some("alpha"));
     }
 
     #[test]
