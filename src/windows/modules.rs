@@ -469,23 +469,11 @@ pub fn next_selectable(selected: usize, total: usize, rows: &[GroupedRow], dir: 
 /// silent — a list that scrolls wrong, or a selection that drifts off the
 /// viewport. One tested truth beats three inline `min()`s.
 pub fn scroll_for(selected: usize, scroll: usize, visible: usize, total: usize) -> usize {
-    if total == 0 || visible == 0 {
-        return 0;
-    }
-    // Never past the end: the last row must land on the last line rather than
-    // the view overshooting into blank rows below it.
-    let max_scroll = total.saturating_sub(visible);
-    let scroll = scroll.min(max_scroll);
-    if selected < scroll {
-        // Above the viewport: bring it to the top line.
-        selected.min(max_scroll)
-    } else if selected >= scroll + visible {
-        // Below the viewport: scroll exactly far enough to land it on the
-        // last line, so stepping down one row moves the view one row.
-        (selected + 1).saturating_sub(visible).min(max_scroll)
-    } else {
-        scroll
-    }
+    // Keep a SCROLL_MARGIN-row band at the top and bottom of the viewport: the
+    // cursor moves freely through the middle and only when it enters the band
+    // does the list scroll behind it, holding the cursor in place. Shares the
+    // editor list's margin logic so both lists scroll identically.
+    editor_scroll_for(selected, scroll, visible, SCROLL_MARGIN, total)
 }
 
 /// The window hint bar's action labels for one selected row.
@@ -962,7 +950,7 @@ struct ConfigEditor {
 
 /// How many lines of context the editor keeps between the cursor and the top or
 /// bottom edge before it scrolls.
-const EDITOR_SCROLL_MARGIN: usize = 3;
+const SCROLL_MARGIN: usize = 3;
 
 /// One rendered line of the config editor.
 ///
@@ -1824,7 +1812,7 @@ fn render_editor(&mut self, area: Rect, buf: &mut Buffer, is_active: bool, color
             selected_line,
             ed.scroll,
             visible,
-            EDITOR_SCROLL_MARGIN,
+            SCROLL_MARGIN,
             total,
         );
 
@@ -4383,7 +4371,7 @@ SECRET=s3
 mod editor_scroll_tests {
     use super::{
         editor_lines, editor_scroll_for, editor_selected_line, EditorLine, EditorRow, ModulesWindow,
-        RowKind, Seg, ValueKind, EDITOR_SCROLL_MARGIN,
+        RowKind, Seg, ValueKind, SCROLL_MARGIN,
     };
     use crate::app::ConfigTarget;
 
@@ -4465,7 +4453,7 @@ mod editor_scroll_tests {
     fn the_view_does_not_scroll_until_the_cursor_is_within_the_margin() {
         // 20 visible lines, cursor at visual line 5 (0-indexed): 5 lines of
         // context above, so scroll must stay put.
-        let s = editor_scroll_for(5, 0, 20, EDITOR_SCROLL_MARGIN, 200);
+        let s = editor_scroll_for(5, 0, 20, SCROLL_MARGIN, 200);
         assert_eq!(s, 0, "scrolled too eagerly at line 5");
     }
 
@@ -4473,25 +4461,25 @@ mod editor_scroll_tests {
     fn the_cursor_is_pushed_to_the_third_line_from_the_top() {
         // Cursor at line 2 with scroll 0: too close to the top, so scroll back
         // until the cursor sits `margin` lines down.
-        let s = editor_scroll_for(2, 0, 20, EDITOR_SCROLL_MARGIN, 200);
+        let s = editor_scroll_for(2, 0, 20, SCROLL_MARGIN, 200);
         assert_eq!(s, 0, "cannot scroll above the start of the content");
         // Now from a scrolled position: line 3 with scroll 0 -> stay.
-        assert_eq!(editor_scroll_for(3, 0, 20, EDITOR_SCROLL_MARGIN, 200), 0);
+        assert_eq!(editor_scroll_for(3, 0, 20, SCROLL_MARGIN, 200), 0);
         // Line 4 is one past the margin; still no scroll needed.
-        assert_eq!(editor_scroll_for(4, 0, 20, EDITOR_SCROLL_MARGIN, 200), 0);
+        assert_eq!(editor_scroll_for(4, 0, 20, SCROLL_MARGIN, 200), 0);
     }
 
     #[test]
     fn the_cursor_is_pushed_to_the_third_line_from_the_bottom() {
         // Cursor at line 25, viewport 20, scroll 0: needs scroll = 25+3+1-20 = 9,
         // leaving the cursor at index 16, which is 3 lines up from the bottom.
-        let s = editor_scroll_for(25, 0, 20, EDITOR_SCROLL_MARGIN, 200);
+        let s = editor_scroll_for(25, 0, 20, SCROLL_MARGIN, 200);
         assert_eq!(s, 9);
         let cursor_at = 25 - s;
         assert_eq!(cursor_at, 16);
         assert_eq!(
             (20 - 1) - cursor_at,
-            EDITOR_SCROLL_MARGIN,
+            SCROLL_MARGIN,
             "cursor should sit 3 lines up from the bottom edge"
         );
     }
@@ -4505,7 +4493,7 @@ mod editor_scroll_tests {
         let mut scroll = 0usize;
         let mut first_scroll_at = None;
         for line in 0..40 {
-            let next = editor_scroll_for(line, scroll, visible, EDITOR_SCROLL_MARGIN, 200);
+            let next = editor_scroll_for(line, scroll, visible, SCROLL_MARGIN, 200);
             if next != scroll {
                 if first_scroll_at.is_none() {
                     first_scroll_at = Some(line);
@@ -4514,7 +4502,7 @@ mod editor_scroll_tests {
                 // bottom on every subsequent step.
                 assert_eq!(
                     line - next,
-                    visible - 1 - EDITOR_SCROLL_MARGIN,
+                    visible - 1 - SCROLL_MARGIN,
                     "cursor drifted from the margin at line {}",
                     line
                 );
@@ -4523,7 +4511,7 @@ mod editor_scroll_tests {
         }
         // Scrolling starts when the cursor first has fewer than `margin` lines
         // below it: line 16 still has 3, line 17 has only 2.
-        assert_eq!(first_scroll_at, Some(visible - EDITOR_SCROLL_MARGIN));
+        assert_eq!(first_scroll_at, Some(visible - SCROLL_MARGIN));
     }
 
     #[test]
@@ -4531,9 +4519,9 @@ mod editor_scroll_tests {
         // No scrolling at all while the cursor travels through the middle band.
         let visible = 20usize;
         let scroll = 0usize;
-        for line in EDITOR_SCROLL_MARGIN..=(visible - 1 - EDITOR_SCROLL_MARGIN) {
+        for line in SCROLL_MARGIN..=(visible - 1 - SCROLL_MARGIN) {
             assert_eq!(
-                editor_scroll_for(line, scroll, visible, EDITOR_SCROLL_MARGIN, 200),
+                editor_scroll_for(line, scroll, visible, SCROLL_MARGIN, 200),
                 scroll,
                 "scrolled at line {} but the cursor had room on both sides",
                 line
@@ -4549,7 +4537,7 @@ mod editor_scroll_tests {
         let visible = 20usize;
         let mut scroll = 0usize;
         for line in 0..total {
-            scroll = editor_scroll_for(line, scroll, visible, EDITOR_SCROLL_MARGIN, total);
+            scroll = editor_scroll_for(line, scroll, visible, SCROLL_MARGIN, total);
             assert!(
                 line >= scroll && line < scroll + visible,
                 "cursor at display line {} is outside the viewport {}..{} (scroll {})",
@@ -4565,10 +4553,10 @@ mod editor_scroll_tests {
     fn a_short_viewport_degrades_to_keeping_the_cursor_visible() {
         // With fewer than 2*margin+1 lines there is no way to honour both
         // margins; the cursor must still never be pushed off screen.
-        for visible in 1..=(EDITOR_SCROLL_MARGIN * 2) {
+        for visible in 1..=(SCROLL_MARGIN * 2) {
             let total = 40usize;
             for line in 0..total {
-                let s = editor_scroll_for(line, 0, visible, EDITOR_SCROLL_MARGIN, total);
+                let s = editor_scroll_for(line, 0, visible, SCROLL_MARGIN, total);
                 assert!(
                     line >= s && line < s + visible,
                     "visible={} line={} scroll={} -> cursor off screen",
@@ -4586,13 +4574,13 @@ mod editor_scroll_tests {
         // not overshoot into blank space.
         let total = 25usize;
         let visible = 10usize;
-        let s = editor_scroll_for(total - 1, 0, visible, EDITOR_SCROLL_MARGIN, total);
+        let s = editor_scroll_for(total - 1, 0, visible, SCROLL_MARGIN, total);
         assert_eq!(s, total - visible, "should sit flush with the end");
     }
 
     #[test]
     fn a_zero_height_viewport_is_safe() {
-        assert_eq!(editor_scroll_for(5, 3, 0, EDITOR_SCROLL_MARGIN, 10), 0);
+        assert_eq!(editor_scroll_for(5, 3, 0, SCROLL_MARGIN, 10), 0);
     }
 
     /// The end-to-end version of the reported bug: drive the REAL editor through
@@ -5163,6 +5151,27 @@ mod engine_row_tests {
             ENGINE_ROW,
             "up from the top header must clamp on the engine row"
         );
+    }
+
+    #[test]
+    fn the_module_list_keeps_a_scroll_margin() {
+        // A tall viewport: the cursor moves through the middle band without
+        // moving the view, and the view scrolls only once the cursor enters the
+        // 3-row band at an edge (holding the cursor SCROLL_MARGIN from it).
+        let visible = 20;
+        let total = 100;
+        // The cursor moving well inside the viewport leaves the view alone.
+        assert_eq!(scroll_for(0, 0, visible, total), 0);
+        assert_eq!(scroll_for(5, 0, visible, total), 0);
+        // Within 3 of the bottom edge (line 17 of 0..19) the view starts to
+        // scroll, keeping the cursor 3 rows above the bottom line.
+        assert_eq!(scroll_for(17, 0, visible, total), 1);
+        let scroll = scroll_for(18, 0, visible, total);
+        assert_eq!(scroll, 2);
+        assert_eq!(18, scroll + visible - 1 - 3, "cursor sits 3 above the bottom edge");
+        // Coming back up, the view scrolls under the cursor once it is within 3
+        // of the top.
+        assert_eq!(scroll_for(2, 5, visible, total), 0);
     }
 
     #[test]
